@@ -1,0 +1,15 @@
+# Blender auto-backup
+*.blend1
+*.blend2
+*.blend@
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
