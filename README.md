@@ -55,3 +55,29 @@ Not the CAD. Real geometry, tolerances, cell selection, wall-thickness
 safety checks etc. live in `blueband-cad/`. This repo exists only for
 marketing / concept renders. Any dimension mismatch between the two
 is the CAD's fault — CAD is authoritative.
+
+## Standing rule: verification requires opening the PNG
+
+A visual change cannot be claimed "verified in the render" unless the
+rendered PNG has been opened and inspected AFTER the build completed.
+Describing what the geometry SHOULD produce is not verification.
+
+If the PNG has not been opened, the correct phrase is **"not verified"**,
+not "verified in the render". A false verification claim costs a full
+round trip. The user reads these images directly and catches every
+mismatch — an incorrect claim about what's visible is guaranteed to
+be caught within one turn, so there is zero upside to guessing.
+
+Precedent: v9 report claimed "verified in the render — black wedge
+gone". Wedge was still there. The port had moved but the visual
+defect turned out to be the dimple, which the geometry-only reasoning
+did not catch. Bug shipped inside a false verification claim.
+Rule added 2026-08-18.
+
+Also: if a build touches an object's `.location`, `.rotation` or
+`.scale`, call `bpy.context.view_layer.update()` before reading
+`matrix_world` or using the object as a boolean target. Background
+mode does not update the dep-graph automatically. The v9 port stayed
+at Y=0 for the same reason (silently) — bbox dump caught it on the
+retry because we started printing the world bbox after every
+placement.

@@ -686,6 +686,21 @@ def cut_usbc():
     # Deviates from the original "4 mm above underside" brief but the
     # two-shell design didn't exist when that spec was written.
     cutter.location = (0, LB_Y * MM / 2, 0.0)
+    # Force dep-graph update so matrix_world reflects the new location
+    # before we read it or use the object as a boolean target. Without
+    # this, background-mode Blender can leave matrix_world stale — the
+    # v9 defect was exactly this: the port stayed centred at Y=0
+    # instead of Y=+20 because the boolean saw the pre-update matrix.
+    bpy.context.view_layer.update()
+
+    from mathutils import Vector as _V
+    cb = [cutter.matrix_world @ _V(c) for c in cutter.bound_box]
+    print(f"[port_cutter loc     mm] "
+          f"({cutter.location.x*1000:+.3f}, {cutter.location.y*1000:+.3f}, {cutter.location.z*1000:+.3f})")
+    print(f"[port_cutter world bbox mm] "
+          f"X {min(c.x for c in cb)*1000:+.3f}..{max(c.x for c in cb)*1000:+.3f}  "
+          f"Y {min(c.y for c in cb)*1000:+.3f}..{max(c.y for c in cb)*1000:+.3f}  "
+          f"Z {min(c.z for c in cb)*1000:+.3f}..{max(c.z for c in cb)*1000:+.3f}")
 
     # Port now entirely inside top shell — no longer cuts the bottom
     # shell. This also eliminates the seam-crossing interaction that
@@ -965,6 +980,15 @@ def render(path, cam_mm, target_mm=(0,0,0), focal=85,
 # on it. (Manifold has already been asserted at every boolean step
 # above; this is the belt-and-braces summary.)
 # ────────────────────────────────────────────────────────────────────
+print("\n── final world bboxes (mm) ──")
+from mathutils import Vector as _V
+for _n in ("module_top_shell", "module_bottom_shell"):
+    _o = bpy.data.objects[_n]
+    _bb = [_o.matrix_world @ _V(c) for c in _o.bound_box]
+    print(f"  {_n:22s}  X {min(c.x for c in _bb)*1000:+8.3f}..{max(c.x for c in _bb)*1000:+8.3f}   "
+          f"Y {min(c.y for c in _bb)*1000:+8.3f}..{max(c.y for c in _bb)*1000:+8.3f}   "
+          f"Z {min(c.z for c in _bb)*1000:+8.3f}..{max(c.z for c in _bb)*1000:+8.3f}")
+
 print("\n── pre-render mesh stats ──")
 # Objects that are OPEN SURFACES by design — not closed solids, so
 # expected to have open edges (plane = 4 boundary edges; ribbon =
