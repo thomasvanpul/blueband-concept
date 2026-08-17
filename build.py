@@ -290,7 +290,8 @@ def _build_shell(name, plan_x, plan_y, height, z_center,
                  top_fillet_mm, bot_fillet_mm,
                  dome_mm=0.0, convex_bottom_mm=0.0,
                  exempt_plus_y_from_draft=False,
-                 y_offset_mm=0.0):
+                 y_offset_mm=0.0,
+                 plan_corner_mm=4.0):
     """Build a drafted, filleted shell. Draft 6° from top to bottom.
     plan_x, plan_y — nominal top-face outer footprint (before draft).
     z_center — Z position of the mesh centroid.
@@ -317,7 +318,7 @@ def _build_shell(name, plan_x, plan_y, height, z_center,
     bm.to_mesh(me); bm.free()
 
     m1 = obj.modifiers.new("plan_corners", 'BEVEL')
-    m1.width = 4.0 * MM
+    m1.width = plan_corner_mm * MM
     m1.segments = 14
     m1.limit_method = 'WEIGHT'
     apply_all_mods(obj)
@@ -450,27 +451,36 @@ BOT_PLAN_Y_MINUS_ONLY = _top_bot_y_asym - OVERHANG   # inset −Y only
 # to align. The resulting overhang on +Y edge = OVERHANG, on −Y edge =
 # OVERHANG. That's fine.
 # Compute BOT_PLAN_Y so that BOTH the +Y and −Y overhangs come out
-# ≈ 0.4 mm. Top shell +Y at seam = +20 (exempt). Top shell −Y at
-# seam = -(20 - draft_loss). Target: bottom shell +Y = +19.6,
-# bottom shell -Y = -(19.106 - 0.4) = -18.706. Span = 38.306,
-# centre = +0.447. Non-obvious asymmetric placement; documented so
-# nobody "corrects" it later.
+# ≈ 0.4 mm. Non-obvious asymmetric placement; documented so nobody
+# "corrects" it later.
 _top_neg_y_at_seam = -(LB_Y / 2 - math.tan(math.radians(DRAFT_DEG)) * TOP_H)
 _bot_plus_y = LB_Y / 2 - OVERHANG            # +19.6
 _bot_neg_y  = _top_neg_y_at_seam + OVERHANG  # -18.706
 BOT_PLAN_Y = _bot_plus_y - _bot_neg_y        # 38.306 (span)
 BOT_Y_OFFSET = (_bot_plus_y + _bot_neg_y) / 2  # +0.447
 
+# CORNER-BULGE FIX (2026-08-17): the top shell's plan-corner arc gets
+# stretched into an ELLIPSE by the 6° draft (semi-axes ~3.82 × 3.88 at
+# seam instead of the nominal 4 mm circle). A bottom shell with a
+# nominal 4 mm plan corner would then extend past the top shell in
+# the Y direction at the 45° corner by ~0.15 mm — the "saucer" bulge.
+# Fix: shrink the bottom shell's plan-corner radius so its corner arc
+# stays strictly inside the top shell's drafted arc at all angles.
+# 3.0 mm is safe by ~0.4 mm at the diagonal.
+BOT_PLAN_CORNER = 3.0
+
 bottom_shell = _build_shell(
     "module_bottom_shell",
     plan_x=BOT_PLAN_X, plan_y=BOT_PLAN_Y, height=BOT_H,
     z_center=(SEAM_Z - AIR_GAP + (-6.5)) / 2,
     top_fillet_mm=0.0,
-    bot_fillet_mm=3.5,
+    bot_fillet_mm=2.0,          # was 3.5 — per user, softer fillet was
+                                # inflating the corner "sphere"
     dome_mm=0.0,
     convex_bottom_mm=1.0,
     exempt_plus_y_from_draft=False,
     y_offset_mm=BOT_Y_OFFSET,
+    plan_corner_mm=BOT_PLAN_CORNER,
 )
 
 # For material subtractive operations that used to target `module`,
@@ -794,10 +804,37 @@ def render(path, cam_mm, target_mm=(0,0,0), focal=85,
     scn.camera.location = tuple(v * MM for v in cam_mm)
     scn.camera.data.lens = focal
     look_at(scn.camera, tuple(v * MM for v in target_mm))
-    band.hide_render = not show_band
+
+    # HARD hide of every optional object. Sets both hide_render AND
+    # hide_viewport so nothing leaks through in Cycles. Belt-and-
+    # braces: some Blender 5 setups have honoured only one flag.
+    def _hide(ob, hidden: bool):
+        ob.hide_render = hidden
+        ob.hide_viewport = hidden
+        ob.hide_set(hidden)
+
+    _hide(band, not show_band)
     for o in (pcb, cell, usbc):
-        o.hide_render = not show_internals
-    # Attach supplemental lights
+        _hide(o, not show_internals)
+
+    # Explicit whitelist — print what will render so we can audit.
+    ALWAYS_RENDER = {top_shell.name, bottom_shell.name, ground.name, backwall.name}
+    conditional = []
+    if show_band:      conditional.append(band.name)
+    if show_internals: conditional += [pcb.name, cell.name, usbc.name]
+
+    visible = []
+    for ob in bpy.context.scene.objects:
+        if ob.type == 'MESH' and not ob.hide_render:
+            visible.append(ob.name)
+    print(f"[render] {os.path.basename(path)}  visible meshes: {sorted(visible)}")
+    print(f"         expected: {sorted(ALWAYS_RENDER | set(conditional))}")
+    unexpected = set(visible) - (ALWAYS_RENDER | set(conditional))
+    if unexpected:
+        print(f"         UNEXPECTED VISIBLE: {sorted(unexpected)}  ← HIDING NOW")
+        for name in unexpected:
+            _hide(bpy.data.objects[name], True)
+
     supp = []
     if extra_lights:
         for spec in extra_lights:
@@ -805,7 +842,6 @@ def render(path, cam_mm, target_mm=(0,0,0), focal=85,
             supp.append(L)
     scn.render.filepath = path
     bpy.ops.render.render(write_still=True)
-    # Clean up supplemental lights so they don't leak into next shot
     for L in supp:
         bpy.data.objects.remove(L, do_unlink=True)
 
