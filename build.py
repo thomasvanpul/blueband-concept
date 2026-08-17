@@ -397,12 +397,25 @@ def _apply_shell_details(obj, plan_corner_mm,
             e[layer] = 1.0 if pred(e) else 0.0
         bm.to_mesh(me2); bm.free()
 
-    # Plan-corner bevel — vertical edges only (dz dominates)
-    def is_vertical(e):
+    # Plan-corner bevel — ONLY the true corner edges, i.e. edges
+    # whose endpoints span (near) the full shell height. This
+    # excludes stadium-hole arc segments introduced by the USB-C
+    # boolean that happen to be dz-dominant but are not vertical
+    # corners. Threshold of 90 % catches the 4 drafted corner edges
+    # (which span ~99 % of z-height) while rejecting arcs (which
+    # span < 5 %).
+    z_full_span = z_top_local - z_bot_local
+    def is_full_height_corner(e):
         v0, v1 = e.verts
-        return abs(v0.co.z - v1.co.z) > abs(v0.co.x - v1.co.x) and \
-               abs(v0.co.z - v1.co.z) > abs(v0.co.y - v1.co.y)
-    _tag_edges(is_vertical)
+        return abs(v0.co.z - v1.co.z) > 0.90 * z_full_span
+    _tag_edges(is_full_height_corner)
+    n_tagged = 0
+    bm_check = bmesh.new(); bm_check.from_mesh(obj.data)
+    layer = bm_check.edges.layers.float.get("bevel_weight_edge")
+    if layer:
+        n_tagged = sum(1 for e in bm_check.edges if e[layer] > 0.5)
+    bm_check.free()
+    print(f"[plan_corner_tag] {obj.name}: {n_tagged} full-height corner edges tagged")
     m = obj.modifiers.new("plan_corners", 'BEVEL')
     m.width = plan_corner_mm * MM
     m.segments = 14
@@ -462,6 +475,43 @@ def _apply_shell_details(obj, plan_corner_mm,
 
     for p in obj.data.polygons:
         p.use_smooth = True
+
+    # Split-normals at 30° so fillets read as curves while the seam
+    # step / port edges / bottom-shell top edge stay CRISP.
+    #
+    # v8a: bpy.ops.object.shade_smooth_by_angle() — modifier added
+    # according to log, but rendered as a shoebox. Verified via
+    # obj.modifiers dump: modifiers=[]. The operator silently
+    # no-ops in background mode (asset library not loaded).
+    #
+    # v8b (this): bmesh.ops.split_edges on hard edges. Physically
+    # duplicates verts at the split so per-vertex normals become
+    # discontinuous — smooth shading breaks naturally at those
+    # edges without any modifier. Bulletproof, no library dep, no
+    # runtime evaluation. Cost: mesh becomes technically non-manifold
+    # at the split edges (which is fine — the closed-solid stage is
+    # over; every earlier boolean asserted clean while it mattered).
+    threshold = math.radians(30)
+    me = obj.data
+    bm = bmesh.new(); bm.from_mesh(me)
+    hard = []
+    for e in bm.edges:
+        if len(e.link_faces) == 2:
+            try:
+                angle = e.link_faces[0].normal.angle(e.link_faces[1].normal)
+            except ValueError:
+                continue
+            if angle > threshold:
+                hard.append(e)
+    n_hard = len(hard)
+    if hard:
+        bmesh.ops.split_edges(bm, edges=hard)
+    bm.to_mesh(me); bm.free()
+    for p in obj.data.polygons:
+        p.use_smooth = True
+    print(f"[split_edges ✓] {obj.name}  hard_edges={n_hard}  "
+          f"verts_after={len(obj.data.vertices)}")
+
     assign(obj, mat_shell)
 
 # Phase 1 — build drafted boxes only, no bevels or fillets yet.
@@ -886,12 +936,31 @@ def render(path, cam_mm, target_mm=(0,0,0), focal=85,
 # above; this is the belt-and-braces summary.)
 # ────────────────────────────────────────────────────────────────────
 print("\n── pre-render mesh stats ──")
+# Objects that are OPEN SURFACES by design — not closed solids, so
+# expected to have open edges (plane = 4 boundary edges; ribbon =
+# 2 × width). Excluded from the ← BAD flag so it doesn't lose
+# meaning through noise. Add here when adding new intentionally-
+# open geometry.
+OPEN_SURFACE_WHITELIST = {
+    "ground", "backwall", "band",
+    # Shells become technically non-manifold AFTER the display-only
+    # split_edges shading step (verts duplicated at every hard edge).
+    # Their closed-solid stage was manifold-asserted earlier at every
+    # boolean; the final BAD flag would only fire on the post-shading
+    # geometry and be misleading. See _apply_shell_details "v8b".
+    "module_top_shell", "module_bottom_shell",
+}
 for _name in sorted(bpy.data.objects.keys()):
     _ob = bpy.data.objects[_name]
     if _ob.type != 'MESH' or _ob.hide_render:
         continue
     _s = _mesh_stats(_ob)
-    _flag = "" if (_s['non_manifold_edges'] == 0 and _s['open_edges'] == 0) else "  ← BAD"
+    if _name in OPEN_SURFACE_WHITELIST:
+        _flag = "  (open surface, expected)"
+    elif _s['non_manifold_edges'] > 0 or _s['open_edges'] > 0:
+        _flag = "  ← BAD (closed solid must be manifold)"
+    else:
+        _flag = ""
     print(f"  {_name:22s}  verts={_s['verts']:5d}  polys={_s['polys']:5d}  "
           f"non_manifold_e={_s['non_manifold_edges']:4d}  open_e={_s['open_edges']:4d}{_flag}")
 print()
