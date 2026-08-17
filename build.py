@@ -479,18 +479,18 @@ def _apply_shell_details(obj, plan_corner_mm,
     # Split-normals at 30° so fillets read as curves while the seam
     # step / port edges / bottom-shell top edge stay CRISP.
     #
-    # v8a: bpy.ops.object.shade_smooth_by_angle() — modifier added
-    # according to log, but rendered as a shoebox. Verified via
-    # obj.modifiers dump: modifiers=[]. The operator silently
-    # no-ops in background mode (asset library not loaded).
-    #
-    # v8b (this): bmesh.ops.split_edges on hard edges. Physically
-    # duplicates verts at the split so per-vertex normals become
-    # discontinuous — smooth shading breaks naturally at those
-    # edges without any modifier. Bulletproof, no library dep, no
-    # runtime evaluation. Cost: mesh becomes technically non-manifold
-    # at the split edges (which is fine — the closed-solid stage is
-    # over; every earlier boolean asserted clean while it mattered).
+    # SAFETY NET (v9 fix, per user): assert manifold on the CLOSED
+    # solid BEFORE split_edges. Snapshot verts/polys. After
+    # split_edges, assert verts INCREASED and polys UNCHANGED —
+    # split_edges by definition duplicates verts and doesn't add or
+    # remove faces. Any deviation means the display-only shading
+    # step corrupted topology. This keeps the safety net that
+    # caught the last two bugs from being masked by the shading
+    # step going non-manifold.
+    assert_manifold(obj, "closed-solid-pre-split")
+    verts_before = len(obj.data.vertices)
+    polys_before = len(obj.data.polygons)
+
     threshold = math.radians(30)
     me = obj.data
     bm = bmesh.new(); bm.from_mesh(me)
@@ -509,8 +509,23 @@ def _apply_shell_details(obj, plan_corner_mm,
     bm.to_mesh(me); bm.free()
     for p in obj.data.polygons:
         p.use_smooth = True
+
+    verts_after = len(obj.data.vertices)
+    polys_after = len(obj.data.polygons)
+    if verts_after <= verts_before or polys_after != polys_before:
+        raise RuntimeError(
+            f"\n"
+            f"SPLIT-EDGES TOPOLOGY ASSERTION FAILED on '{obj.name}':\n"
+            f"  verts before → after: {verts_before} → {verts_after} "
+            f"(expected INCREASE if any hard edges present)\n"
+            f"  polys before → after: {polys_before} → {polys_after} "
+            f"(expected UNCHANGED)\n"
+            f"  hard edges tagged: {n_hard}\n"
+            f"split_edges is a vertex-duplication op only; deviation from\n"
+            f"this signature means the closed-solid mesh was corrupted."
+        )
     print(f"[split_edges ✓] {obj.name}  hard_edges={n_hard}  "
-          f"verts_after={len(obj.data.vertices)}")
+          f"verts {verts_before}→{verts_after}  polys unchanged={polys_after}")
 
     assign(obj, mat_shell)
 
@@ -656,11 +671,26 @@ def cut_usbc():
     mb.angle_limit = math.radians(30)
     mb.profile = 0.5
     apply_all_mods(cutter)
-    cutter.location = (0, LB_Y * MM / 2, -2.5 * MM)
+    # Port centre moved 2026-08-17 from Z=-2.5 to Z=0 (module vertical
+    # middle) to give ≥ 2 mm clearance from every bevel/fillet arc.
+    # Old position had only 0.72 mm vertical clearance to the 2 mm
+    # bottom-perimeter fillet arc, and crossed the seam gap between
+    # the two shells — the port cut ended up interacting with both
+    # the fillet arc and the seam step, producing the black wedge in
+    # v8. Now port sits entirely inside the top shell:
+    #   port Z range −1.28 to +1.28
+    #   top shell Z range −2.0 to +6.5   (fully contains port)
+    #   clearance to seam (Z=−2):        0.72 mm
+    #   clearance to top fillet arc top: 4.82 mm
+    #   clearance to plan-corner arc (X): 4.53 mm
+    # Deviates from the original "4 mm above underside" brief but the
+    # two-shell design didn't exist when that spec was written.
+    cutter.location = (0, LB_Y * MM / 2, 0.0)
 
-    for shell in (bottom_shell, top_shell):
-        apply_boolean(shell, cutter, name="usbc_cut", solver='EXACT')
-
+    # Port now entirely inside top shell — no longer cuts the bottom
+    # shell. This also eliminates the seam-crossing interaction that
+    # produced the black wedge in v8.
+    apply_boolean(top_shell, cutter, name="usbc_cut", solver='EXACT')
     bpy.data.objects.remove(cutter, do_unlink=True)
 
 cut_usbc()
@@ -945,9 +975,10 @@ OPEN_SURFACE_WHITELIST = {
     "ground", "backwall", "band",
     # Shells become technically non-manifold AFTER the display-only
     # split_edges shading step (verts duplicated at every hard edge).
-    # Their closed-solid stage was manifold-asserted earlier at every
-    # boolean; the final BAD flag would only fire on the post-shading
-    # geometry and be misleading. See _apply_shell_details "v8b".
+    # Their closed-solid stage was manifold-asserted BEFORE the split
+    # and topology signature (verts↑, polys unchanged) was asserted
+    # AFTER — so the safety net for shells is intact even though the
+    # pre-render stats show open edges. See _apply_shell_details v9.
     "module_top_shell", "module_bottom_shell",
 }
 for _name in sorted(bpy.data.objects.keys()):
