@@ -144,14 +144,24 @@ def apply_all_mods(obj):
         bpy.ops.object.modifier_apply(modifier=m.name)
 
 # ────────────────────────────────────────────────────────────────────
-# MODULE — 26 × 40 × 13 mm single tapered form with inscribed seam.
-# Seam at Z = -2.0 (≈ 35 % from bottom → top shell dominant 65 %).
+# MODULE — TWO SEPARATE SHELLS with a real physical step.
+# Top overhangs bottom by 0.4 mm all round; 0.15 mm air gap between them.
+# This is what makes the seam actually read — a groove/shader trick did
+# not. Two independent meshes, two independent materials-ready objects.
 # ────────────────────────────────────────────────────────────────────
 LB_X, LB_Y, LB_Z = 26.0, 40.0, 13.0
-SEAM_Z = -2.0   # module frame; below origin → top shell is bigger volume
+SEAM_Z = -2.0            # top of the gap between shells
+OVERHANG = 0.4           # top shell overhangs bottom by this per side
+AIR_GAP = 0.15           # vertical gap between top-shell bottom face and bottom-shell top face
 DRAFT_DEG = 6.0
 
-def build_module():
+# Vertical extents
+TOP_H = 6.5 - SEAM_Z              # 8.5 mm — top shell dominant
+BOT_H = SEAM_Z - AIR_GAP - (-6.5) # 4.35 mm — bottom shell shallow
+
+# Legacy single-shell builder retained but never called — kept for
+# reference; the new two-shell builders live below.
+def build_module_LEGACY_UNUSED():
     bpy.ops.mesh.primitive_cube_add(size=1)
     obj = bpy.context.active_object
     obj.name = "module_shell"
@@ -273,14 +283,204 @@ def build_module():
     assign(obj, mat_shell)
     return obj
 
-module = build_module()
+# ────────────────────────────────────────────────────────────────────
+# NEW two-shell builders — replaces the single-mesh build.
+# ────────────────────────────────────────────────────────────────────
+def _build_shell(name, plan_x, plan_y, height, z_center,
+                 top_fillet_mm, bot_fillet_mm,
+                 dome_mm=0.0, convex_bottom_mm=0.0,
+                 exempt_plus_y_from_draft=False,
+                 y_offset_mm=0.0):
+    """Build a drafted, filleted shell. Draft 6° from top to bottom.
+    plan_x, plan_y — nominal top-face outer footprint (before draft).
+    z_center — Z position of the mesh centroid.
+    """
+    bpy.ops.mesh.primitive_cube_add(size=1)
+    obj = bpy.context.active_object
+    obj.name = name
+    obj.scale = (plan_x * MM, plan_y * MM, height * MM)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
 
-# ────────────────────────────────────────────────────────────────────
-# SEAM GROOVE — thin inscribed slot around the perimeter at Z = SEAM_Z
-# Cut inward 0.3 mm × 0.35 mm tall. Reads as the two-shell seam
-# without needing two separate meshes.
-# ────────────────────────────────────────────────────────────────────
-def cut_seam():
+    z_top =  height * MM / 2
+    z_bot = -z_top
+
+    # Vertical edges → plan-corner bevel (4 mm)
+    me = obj.data
+    bm = bmesh.new(); bm.from_mesh(me)
+    bwl = bm.edges.layers.float.new("bevel_weight_edge") if "bevel_weight_edge" not in bm.edges.layers.float else bm.edges.layers.float["bevel_weight_edge"]
+    for e in bm.edges:
+        v0, v1 = e.verts
+        dz = abs(v0.co.z - v1.co.z)
+        dx = abs(v0.co.x - v1.co.x)
+        dy = abs(v0.co.y - v1.co.y)
+        e[bwl] = 1.0 if (dz > dx and dz > dy) else 0.0
+    bm.to_mesh(me); bm.free()
+
+    m1 = obj.modifiers.new("plan_corners", 'BEVEL')
+    m1.width = 4.0 * MM
+    m1.segments = 14
+    m1.limit_method = 'WEIGHT'
+    apply_all_mods(obj)
+
+    # Bottom perimeter fillet
+    if bot_fillet_mm > 0:
+        me = obj.data
+        bm = bmesh.new(); bm.from_mesh(me)
+        bwl = bm.edges.layers.float.new("bevel_weight_edge") if "bevel_weight_edge" not in bm.edges.layers.float else bm.edges.layers.float["bevel_weight_edge"]
+        for e in bm.edges:
+            v0, v1 = e.verts
+            dz = abs(v0.co.z - v1.co.z)
+            if abs(v0.co.z - z_bot) < 1e-4 and abs(v1.co.z - z_bot) < 1e-4 and dz < 1e-4:
+                e[bwl] = 1.0
+            else:
+                e[bwl] = 0.0
+        bm.to_mesh(me); bm.free()
+        m2 = obj.modifiers.new("bot_fillet", 'BEVEL')
+        m2.width = bot_fillet_mm * MM
+        m2.segments = 12
+        m2.limit_method = 'WEIGHT'
+        apply_all_mods(obj)
+
+    # Top perimeter fillet
+    if top_fillet_mm > 0:
+        me = obj.data
+        bm = bmesh.new(); bm.from_mesh(me)
+        bwl = bm.edges.layers.float.new("bevel_weight_edge") if "bevel_weight_edge" not in bm.edges.layers.float else bm.edges.layers.float["bevel_weight_edge"]
+        for e in bm.edges:
+            v0, v1 = e.verts
+            dz = abs(v0.co.z - v1.co.z)
+            if abs(v0.co.z - z_top) < 1e-4 and abs(v1.co.z - z_top) < 1e-4 and dz < 1e-4:
+                e[bwl] = 1.0
+            else:
+                e[bwl] = 0.0
+        bm.to_mesh(me); bm.free()
+        m3 = obj.modifiers.new("top_fillet", 'BEVEL')
+        m3.width = top_fillet_mm * MM
+        m3.segments = 6
+        m3.limit_method = 'WEIGHT'
+        apply_all_mods(obj)
+
+    # 6° draft — bottom vertices inset. Optionally skip +Y face verts.
+    tan6 = math.tan(math.radians(DRAFT_DEG))
+    inset_bot = tan6 * height
+    sx_bot = 1.0 - (inset_bot / (plan_x / 2))
+    sy_bot = 1.0 - (inset_bot / (plan_y / 2))
+    me = obj.data
+    bm = bmesh.new(); bm.from_mesh(me)
+    y_max = max(v.co.y for v in bm.verts)
+    for v in bm.verts:
+        t = max(0.0, min(1.0, (v.co.z - z_top) / (z_bot - z_top)))
+        sx = 1.0 - t * (1.0 - sx_bot)
+        near_port = exempt_plus_y_from_draft and (y_max - v.co.y) < 1.2 * MM
+        sy = 1.0 if near_port else 1.0 - t * (1.0 - sy_bot)
+        v.co.x *= sx
+        v.co.y *= sy
+    bm.to_mesh(me); bm.free()
+
+    # Dome top
+    if dome_mm > 0:
+        me = obj.data
+        bm = bmesh.new(); bm.from_mesh(me)
+        for v in bm.verts:
+            if v.co.z > z_top - 0.4 * MM and not (exempt_plus_y_from_draft and (y_max - v.co.y) < 1.2 * MM):
+                rx = abs(v.co.x) / (plan_x * MM / 2)
+                ry = abs(v.co.y) / (plan_y * MM / 2)
+                r = min(1.0, math.sqrt(rx * rx + ry * ry))
+                v.co.z += (1.0 - r * r) * dome_mm * MM
+        bm.to_mesh(me); bm.free()
+
+    # Convex bottom
+    if convex_bottom_mm > 0:
+        me = obj.data
+        bm = bmesh.new(); bm.from_mesh(me)
+        for v in bm.verts:
+            if v.co.z < z_bot + 0.6 * MM:
+                rx = abs(v.co.x) / (plan_x * MM / 2)
+                ry = abs(v.co.y) / (plan_y * MM / 2)
+                r = min(1.0, math.sqrt(rx * rx + ry * ry))
+                v.co.z -= (1.0 - r * r) * convex_bottom_mm * MM
+        bm.to_mesh(me); bm.free()
+
+    # Position centre — Y offset allows asymmetric placement so
+    # +Y face can stay flush with the top shell's +Y face while
+    # −Y and ±X stay uniformly inset by OVERHANG.
+    obj.location = (0, y_offset_mm * MM, z_center * MM)
+
+    for p in obj.data.polygons:
+        p.use_smooth = True
+    assign(obj, mat_shell)
+    return obj
+
+# Top shell — 26 × 40 at top (Z=+6.5), drafts to Z=SEAM_Z=-2.
+# Top fillet 0.4 mm (crisp — the CRISP-vs-SOFT contrast is the point).
+# NO bottom fillet on top shell — bottom edge is the seam step.
+top_shell = _build_shell(
+    "module_top_shell",
+    plan_x=LB_X, plan_y=LB_Y, height=TOP_H,
+    z_center=(6.5 + SEAM_Z) / 2,     # +2.25
+    top_fillet_mm=0.4,
+    bot_fillet_mm=0.0,
+    dome_mm=0.5,
+    convex_bottom_mm=0.0,
+    exempt_plus_y_from_draft=True,
+)
+
+# Bottom shell — inset 0.4 mm per side from where top shell ends.
+# Top shell at Z=SEAM_Z has footprint 26 − 2·tan(6°)·TOP_H per axis
+# (with +Y exempted). Bottom shell top footprint = that minus 0.8 mm
+# in ±X and −Y; +Y stays flush with top shell for the port face.
+_top_bot_x = LB_X - 2 * math.tan(math.radians(DRAFT_DEG)) * TOP_H      # ≈ 24.21
+_top_bot_y = LB_Y - 2 * math.tan(math.radians(DRAFT_DEG)) * TOP_H      # (draft in −Y only)
+# Actually with +Y exempted, +Y stays at +LB_Y/2 = +20 and −Y at
+# −(20 - inset). So Y footprint of top shell at seam is 20 - (−(20 - inset))
+# = 40 - inset. Approx 40 - 0.89 = 39.11.
+_top_bot_y_asym = LB_Y - math.tan(math.radians(DRAFT_DEG)) * TOP_H     # ≈ 39.11
+# Bottom shell nominal: top-face outer = top-shell-bottom minus 0.4 per side
+BOT_PLAN_X = _top_bot_x - 2 * OVERHANG
+BOT_PLAN_Y_MINUS_ONLY = _top_bot_y_asym - OVERHANG   # inset −Y only
+# +Y edge stays at +20 (flush with top shell so the port face is one line).
+# Nominal top-face y-length of bottom shell = (+20 - (−(top_bot_y_asym - OVERHANG - 20)))
+# Simpler: bottom-shell nominal = (LB_X - 2·(draft loss over TOP_H) - 2·OVERHANG)
+# Y nominal = (LB_Y - (draft loss over TOP_H at −Y) - OVERHANG)
+# But bottom-shell builder centres its top face on X=0, Y=0. If we want the
+# +Y edge flush with top shell (+20), and −Y edge inset by OVERHANG from
+# where the top shell's −Y face ends, the bottom shell needs a Y OFFSET —
+# it isn't centred on Y=0. Small annoyance; for MVP compute Y nominal
+# assuming symmetric inset (both edges inset by OVERHANG) and shift +Y
+# to align. The resulting overhang on +Y edge = OVERHANG, on −Y edge =
+# OVERHANG. That's fine.
+# Compute BOT_PLAN_Y so that BOTH the +Y and −Y overhangs come out
+# ≈ 0.4 mm. Top shell +Y at seam = +20 (exempt). Top shell −Y at
+# seam = -(20 - draft_loss). Target: bottom shell +Y = +19.6,
+# bottom shell -Y = -(19.106 - 0.4) = -18.706. Span = 38.306,
+# centre = +0.447. Non-obvious asymmetric placement; documented so
+# nobody "corrects" it later.
+_top_neg_y_at_seam = -(LB_Y / 2 - math.tan(math.radians(DRAFT_DEG)) * TOP_H)
+_bot_plus_y = LB_Y / 2 - OVERHANG            # +19.6
+_bot_neg_y  = _top_neg_y_at_seam + OVERHANG  # -18.706
+BOT_PLAN_Y = _bot_plus_y - _bot_neg_y        # 38.306 (span)
+BOT_Y_OFFSET = (_bot_plus_y + _bot_neg_y) / 2  # +0.447
+
+bottom_shell = _build_shell(
+    "module_bottom_shell",
+    plan_x=BOT_PLAN_X, plan_y=BOT_PLAN_Y, height=BOT_H,
+    z_center=(SEAM_Z - AIR_GAP + (-6.5)) / 2,
+    top_fillet_mm=0.0,
+    bot_fillet_mm=3.5,
+    dome_mm=0.0,
+    convex_bottom_mm=1.0,
+    exempt_plus_y_from_draft=False,
+    y_offset_mm=BOT_Y_OFFSET,
+)
+
+# For material subtractive operations that used to target `module`,
+# now target the bottom shell (that's where USB-C mouth and dimples
+# live — everything below the seam).
+module = bottom_shell
+
+
+# Old single-shell seam-cut function — no longer used.
+def cut_seam_UNUSED():
     # Build a ring: outer box slightly larger than module,
     # inner cutter smaller than module (leaves a wall-inward slot).
     # Simplest: build a hollow "collar" that intersects only the wall.
@@ -323,9 +523,10 @@ def cut_seam():
     apply_all_mods(module)
     bpy.data.objects.remove(o, do_unlink=True)
 
-cut_seam()
+# cut_seam() no longer called — seam is now a real physical step
+# between top_shell and bottom_shell (see two-shell builders above).
 
-# Re-smooth after boolean
+# Re-smooth after any later booleans on bottom shell
 for p in module.data.polygons:
     p.use_smooth = True
 
@@ -333,6 +534,10 @@ for p in module.data.polygons:
 # USB-C MOUTH
 # ────────────────────────────────────────────────────────────────────
 def cut_usbc():
+    # Cut the port into BOTH shells because the mouth (Z = -2.5,
+    # height 2.56 mm) crosses the seam gap (Z = -2.15 to -2.0).
+    # Without this the port would clip to whichever shell it's
+    # applied to. Use one cutter, boolean it against both shells.
     w, h, depth = 8.34, 2.56, 4.0
     bpy.ops.mesh.primitive_cube_add(size=1)
     cutter = bpy.context.active_object
@@ -347,12 +552,14 @@ def cut_usbc():
     mb.profile = 0.5
     apply_all_mods(cutter)
     cutter.location = (0, LB_Y * MM / 2, -2.5 * MM)
-    mb = module.modifiers.new("usbc_cut", 'BOOLEAN')
-    mb.operation = 'DIFFERENCE'
-    mb.object = cutter
-    mb.solver = 'MANIFOLD'
-    bpy.context.view_layer.objects.active = module
-    apply_all_mods(module)
+
+    for shell in (bottom_shell, top_shell):
+        mb = shell.modifiers.new("usbc_cut", 'BOOLEAN')
+        mb.operation = 'DIFFERENCE'
+        mb.object = cutter
+        mb.solver = 'EXACT'
+        bpy.context.view_layer.objects.active = shell
+        apply_all_mods(shell)
     bpy.data.objects.remove(cutter, do_unlink=True)
 
 cut_usbc()
@@ -474,29 +681,31 @@ def build_band():
         bp.handle_right_type = 'FREE'
 
     pts = spline.bezier_points
-    z_deep = -55.0
-    # Horizontal for 5 mm past module, then arc down
-    _pt(pts[0], (0, +y_ex,      z_ex),
-                (0, +y_ex - 5,  z_ex),
-                (0, +y_ex + 5,  z_ex))
-    _pt(pts[1], (0, +y_ex + 6,  z_ex),
-                (0, +y_ex + 3,  z_ex),
-                (0, +y_ex + 12, z_ex - 4))
-    _pt(pts[2], (0, +y_ex + 18, z_ex - 20),
-                (0, +y_ex + 22, z_ex - 8),
-                (0, +y_ex + 16, z_ex - 30))
-    _pt(pts[3], (0, 0,          z_deep),
-                (0, +18,        z_deep),
-                (0, -18,        z_deep))
-    _pt(pts[4], (0, -(y_ex + 18), z_ex - 20),
-                (0, -(y_ex + 16), z_ex - 30),
-                (0, -(y_ex + 22), z_ex - 8))
-    _pt(pts[5], (0, -(y_ex + 6), z_ex),
-                (0, -(y_ex + 12), z_ex - 4),
-                (0, -(y_ex + 3), z_ex))
-    _pt(pts[6], (0, -y_ex,      z_ex),
-                (0, -y_ex + 5,  z_ex),
-                (0, -y_ex - 5,  z_ex))
+    z_deep = -45.0     # raised from -55 so the loop's low point is closer
+    # Extend the flat horizontal run to 11 mm past the wall on each side
+    # (was 6 mm), then arc down. Eliminates the V-shaped bite at the
+    # bottom middle.
+    _pt(pts[0], (0, +y_ex,       z_ex),
+                (0, +y_ex - 6,   z_ex),
+                (0, +y_ex + 6,   z_ex))
+    _pt(pts[1], (0, +y_ex + 11,  z_ex),
+                (0, +y_ex + 5,   z_ex),
+                (0, +y_ex + 17,  z_ex - 3))
+    _pt(pts[2], (0, +y_ex + 22,  z_ex - 16),
+                (0, +y_ex + 24,  z_ex - 8),
+                (0, +y_ex + 20,  z_ex - 24))
+    _pt(pts[3], (0, 0,           z_deep),
+                (0, +18,         z_deep),
+                (0, -18,         z_deep))
+    _pt(pts[4], (0, -(y_ex + 22), z_ex - 16),
+                (0, -(y_ex + 20), z_ex - 24),
+                (0, -(y_ex + 24), z_ex - 8))
+    _pt(pts[5], (0, -(y_ex + 11), z_ex),
+                (0, -(y_ex + 17), z_ex - 3),
+                (0, -(y_ex + 5),  z_ex))
+    _pt(pts[6], (0, -y_ex,       z_ex),
+                (0, -y_ex + 6,   z_ex),
+                (0, -y_ex - 6,   z_ex))
 
     band_obj = bpy.data.objects.new("band", curve)
     bpy.context.collection.objects.link(band_obj)
