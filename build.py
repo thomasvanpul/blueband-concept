@@ -143,6 +143,48 @@ def apply_all_mods(obj):
     for m in list(obj.modifiers):
         bpy.ops.object.modifier_apply(modifier=m.name)
 
+
+# ────────────────────────────────────────────────────────────────────
+# MANIFOLD ASSERTION — the build refuses to render broken geometry.
+# The C-11 / v5 saucer bug was caused by a boolean silently leaving 195
+# open edges in the bottom shell; verify passed and Cycles rendered it
+# as a plausible-looking shape. This function is the reason that class
+# of bug can no longer ship.
+# ────────────────────────────────────────────────────────────────────
+def _mesh_stats(obj):
+    bm = bmesh.new(); bm.from_mesh(obj.data)
+    non_man = sum(1 for e in bm.edges if not e.is_manifold)
+    open_e  = sum(1 for e in bm.edges if len(e.link_faces) < 2)
+    bm.free()
+    return {
+        'verts': len(obj.data.vertices),
+        'polys': len(obj.data.polygons),
+        'non_manifold_edges': non_man,
+        'open_edges': open_e,
+    }
+
+def assert_manifold(obj, operation: str):
+    s = _mesh_stats(obj)
+    if s['non_manifold_edges'] > 0 or s['open_edges'] > 0:
+        raise RuntimeError(
+            f"\n"
+            f"MANIFOLD ASSERTION FAILED after '{operation}' on '{obj.name}':\n"
+            f"  non-manifold edges: {s['non_manifold_edges']}\n"
+            f"  open edges (boundary/hole): {s['open_edges']}\n"
+            f"  vertices: {s['verts']}   polygons: {s['polys']}\n"
+            f"Build refuses to render broken geometry.\n"
+        )
+    print(f"[manifold ✓] {operation:32s} on {obj.name:22s}  verts={s['verts']:5d} polys={s['polys']:5d}")
+
+def apply_boolean(target, cutter, name, solver='EXACT'):
+    mb = target.modifiers.new(name, 'BOOLEAN')
+    mb.operation = 'DIFFERENCE'
+    mb.object = cutter
+    mb.solver = solver
+    bpy.context.view_layer.objects.active = target
+    apply_all_mods(target)
+    assert_manifold(target, f"boolean:{name}")
+
 # ────────────────────────────────────────────────────────────────────
 # MODULE — TWO SEPARATE SHELLS with a real physical step.
 # Top overhangs bottom by 0.4 mm all round; 0.15 mm air gap between them.
@@ -284,18 +326,23 @@ def build_module_LEGACY_UNUSED():
     return obj
 
 # ────────────────────────────────────────────────────────────────────
-# NEW two-shell builders — replaces the single-mesh build.
+# TWO-PHASE shell build, per user's fix on v6 non-manifold saucer:
+#   Phase 1: drafted BOX, apply booleans (USB-C mouth, dimples) on
+#            simple geometry — no compound curvature at the cut site.
+#            Assert manifold after each boolean.
+#   Phase 2: plan-corner bevel + perimeter fillets + dome + convex.
+#            These are non-destructive shape operations, applied on
+#            the mesh AFTER all subtractive booleans have succeeded.
+#
+# This is the fix for the v5/v6 saucer bug where the USB-C EXACT
+# solver ran over drafted+bevelled+filleted bottom shell and left
+# 195 open edges silently.
 # ────────────────────────────────────────────────────────────────────
-def _build_shell(name, plan_x, plan_y, height, z_center,
-                 top_fillet_mm, bot_fillet_mm,
-                 dome_mm=0.0, convex_bottom_mm=0.0,
-                 exempt_plus_y_from_draft=False,
-                 y_offset_mm=0.0,
-                 plan_corner_mm=4.0):
-    """Build a drafted, filleted shell. Draft 6° from top to bottom.
-    plan_x, plan_y — nominal top-face outer footprint (before draft).
-    z_center — Z position of the mesh centroid.
-    """
+def _build_drafted_box(name, plan_x, plan_y, height, z_center,
+                        y_offset_mm=0.0, exempt_plus_y_from_draft=False):
+    """Phase 1: primitive box + 6° draft. Placed at its final world
+    position immediately so booleans and later ops can use world coords.
+    Returns a clean manifold mesh."""
     bpy.ops.mesh.primitive_cube_add(size=1)
     obj = bpy.context.active_object
     obj.name = name
@@ -305,63 +352,6 @@ def _build_shell(name, plan_x, plan_y, height, z_center,
     z_top =  height * MM / 2
     z_bot = -z_top
 
-    # Vertical edges → plan-corner bevel (4 mm)
-    me = obj.data
-    bm = bmesh.new(); bm.from_mesh(me)
-    bwl = bm.edges.layers.float.new("bevel_weight_edge") if "bevel_weight_edge" not in bm.edges.layers.float else bm.edges.layers.float["bevel_weight_edge"]
-    for e in bm.edges:
-        v0, v1 = e.verts
-        dz = abs(v0.co.z - v1.co.z)
-        dx = abs(v0.co.x - v1.co.x)
-        dy = abs(v0.co.y - v1.co.y)
-        e[bwl] = 1.0 if (dz > dx and dz > dy) else 0.0
-    bm.to_mesh(me); bm.free()
-
-    m1 = obj.modifiers.new("plan_corners", 'BEVEL')
-    m1.width = plan_corner_mm * MM
-    m1.segments = 14
-    m1.limit_method = 'WEIGHT'
-    apply_all_mods(obj)
-
-    # Bottom perimeter fillet
-    if bot_fillet_mm > 0:
-        me = obj.data
-        bm = bmesh.new(); bm.from_mesh(me)
-        bwl = bm.edges.layers.float.new("bevel_weight_edge") if "bevel_weight_edge" not in bm.edges.layers.float else bm.edges.layers.float["bevel_weight_edge"]
-        for e in bm.edges:
-            v0, v1 = e.verts
-            dz = abs(v0.co.z - v1.co.z)
-            if abs(v0.co.z - z_bot) < 1e-4 and abs(v1.co.z - z_bot) < 1e-4 and dz < 1e-4:
-                e[bwl] = 1.0
-            else:
-                e[bwl] = 0.0
-        bm.to_mesh(me); bm.free()
-        m2 = obj.modifiers.new("bot_fillet", 'BEVEL')
-        m2.width = bot_fillet_mm * MM
-        m2.segments = 12
-        m2.limit_method = 'WEIGHT'
-        apply_all_mods(obj)
-
-    # Top perimeter fillet
-    if top_fillet_mm > 0:
-        me = obj.data
-        bm = bmesh.new(); bm.from_mesh(me)
-        bwl = bm.edges.layers.float.new("bevel_weight_edge") if "bevel_weight_edge" not in bm.edges.layers.float else bm.edges.layers.float["bevel_weight_edge"]
-        for e in bm.edges:
-            v0, v1 = e.verts
-            dz = abs(v0.co.z - v1.co.z)
-            if abs(v0.co.z - z_top) < 1e-4 and abs(v1.co.z - z_top) < 1e-4 and dz < 1e-4:
-                e[bwl] = 1.0
-            else:
-                e[bwl] = 0.0
-        bm.to_mesh(me); bm.free()
-        m3 = obj.modifiers.new("top_fillet", 'BEVEL')
-        m3.width = top_fillet_mm * MM
-        m3.segments = 6
-        m3.limit_method = 'WEIGHT'
-        apply_all_mods(obj)
-
-    # 6° draft — bottom vertices inset. Optionally skip +Y face verts.
     tan6 = math.tan(math.radians(DRAFT_DEG))
     inset_bot = tan6 * height
     sx_bot = 1.0 - (inset_bot / (plan_x / 2))
@@ -378,53 +368,111 @@ def _build_shell(name, plan_x, plan_y, height, z_center,
         v.co.y *= sy
     bm.to_mesh(me); bm.free()
 
-    # Dome top
-    if dome_mm > 0:
-        me = obj.data
-        bm = bmesh.new(); bm.from_mesh(me)
-        for v in bm.verts:
-            if v.co.z > z_top - 0.4 * MM and not (exempt_plus_y_from_draft and (y_max - v.co.y) < 1.2 * MM):
-                rx = abs(v.co.x) / (plan_x * MM / 2)
-                ry = abs(v.co.y) / (plan_y * MM / 2)
-                r = min(1.0, math.sqrt(rx * rx + ry * ry))
-                v.co.z += (1.0 - r * r) * dome_mm * MM
-        bm.to_mesh(me); bm.free()
-
-    # Convex bottom
-    if convex_bottom_mm > 0:
-        me = obj.data
-        bm = bmesh.new(); bm.from_mesh(me)
-        for v in bm.verts:
-            if v.co.z < z_bot + 0.6 * MM:
-                rx = abs(v.co.x) / (plan_x * MM / 2)
-                ry = abs(v.co.y) / (plan_y * MM / 2)
-                r = min(1.0, math.sqrt(rx * rx + ry * ry))
-                v.co.z -= (1.0 - r * r) * convex_bottom_mm * MM
-        bm.to_mesh(me); bm.free()
-
-    # Position centre — Y offset allows asymmetric placement so
-    # +Y face can stay flush with the top shell's +Y face while
-    # −Y and ±X stay uniformly inset by OVERHANG.
     obj.location = (0, y_offset_mm * MM, z_center * MM)
-
     for p in obj.data.polygons:
         p.use_smooth = True
     assign(obj, mat_shell)
     return obj
 
-# Top shell — 26 × 40 at top (Z=+6.5), drafts to Z=SEAM_Z=-2.
-# Top fillet 0.4 mm (crisp — the CRISP-vs-SOFT contrast is the point).
-# NO bottom fillet on top shell — bottom edge is the seam step.
-top_shell = _build_shell(
+def _apply_shell_details(obj, plan_corner_mm,
+                         top_fillet_mm=0.0, bot_fillet_mm=0.0,
+                         dome_mm=0.0, convex_bottom_mm=0.0,
+                         exempt_plus_y_from_draft=False):
+    """Phase 2: plan-corner bevel, top/bottom perimeter fillets, dome
+    and convex bottom. Applied AFTER booleans. Asserts manifold after
+    each modifier apply — plan-corner and fillets on a mesh with holes
+    from a bad prior boolean would ALSO produce non-manifold output,
+    and we want to catch that immediately at its cause."""
+    me = obj.data
+    # Local z range (mesh coords; mesh centred at origin before world translate)
+    zs = [v.co.z for v in me.vertices]
+    z_top_local = max(zs)
+    z_bot_local = min(zs)
+
+    def _tag_edges(pred):
+        me2 = obj.data
+        bm = bmesh.new(); bm.from_mesh(me2)
+        layer = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
+        for e in bm.edges:
+            e[layer] = 1.0 if pred(e) else 0.0
+        bm.to_mesh(me2); bm.free()
+
+    # Plan-corner bevel — vertical edges only (dz dominates)
+    def is_vertical(e):
+        v0, v1 = e.verts
+        return abs(v0.co.z - v1.co.z) > abs(v0.co.x - v1.co.x) and \
+               abs(v0.co.z - v1.co.z) > abs(v0.co.y - v1.co.y)
+    _tag_edges(is_vertical)
+    m = obj.modifiers.new("plan_corners", 'BEVEL')
+    m.width = plan_corner_mm * MM
+    m.segments = 14
+    m.limit_method = 'WEIGHT'
+    apply_all_mods(obj)
+    assert_manifold(obj, "plan_corner_bevel")
+
+    # Bottom perimeter fillet
+    if bot_fillet_mm > 0:
+        def is_bot_perim(e):
+            v0, v1 = e.verts
+            return (abs(v0.co.z - z_bot_local) < 1e-4 and
+                    abs(v1.co.z - z_bot_local) < 1e-4 and
+                    abs(v0.co.z - v1.co.z) < 1e-4)
+        _tag_edges(is_bot_perim)
+        m = obj.modifiers.new("bot_fillet", 'BEVEL')
+        m.width = bot_fillet_mm * MM
+        m.segments = 12
+        m.limit_method = 'WEIGHT'
+        apply_all_mods(obj)
+        assert_manifold(obj, "bot_perimeter_fillet")
+
+    # Top perimeter fillet
+    if top_fillet_mm > 0:
+        def is_top_perim(e):
+            v0, v1 = e.verts
+            return (abs(v0.co.z - z_top_local) < 1e-4 and
+                    abs(v1.co.z - z_top_local) < 1e-4 and
+                    abs(v0.co.z - v1.co.z) < 1e-4)
+        _tag_edges(is_top_perim)
+        m = obj.modifiers.new("top_fillet", 'BEVEL')
+        m.width = top_fillet_mm * MM
+        m.segments = 6
+        m.limit_method = 'WEIGHT'
+        apply_all_mods(obj)
+        assert_manifold(obj, "top_perimeter_fillet")
+
+    # Dome + convex — mesh-local vertex displacement, doesn't affect topology
+    if dome_mm > 0 or convex_bottom_mm > 0:
+        me = obj.data
+        zs = [v.co.z for v in me.vertices]
+        z_top_new = max(zs); z_bot_new = min(zs)
+        bm = bmesh.new(); bm.from_mesh(me)
+        y_max = max(v.co.y for v in bm.verts)
+        half_x = max(abs(v.co.x) for v in bm.verts) or 1
+        half_y = max(abs(v.co.y) for v in bm.verts) or 1
+        for v in bm.verts:
+            rx = abs(v.co.x) / half_x
+            ry = abs(v.co.y) / half_y
+            r = min(1.0, math.sqrt(rx * rx + ry * ry))
+            near_port = exempt_plus_y_from_draft and (y_max - v.co.y) < 1.2 * MM
+            if dome_mm > 0 and v.co.z > z_top_new - 0.4 * MM and not near_port:
+                v.co.z += (1.0 - r * r) * dome_mm * MM
+            elif convex_bottom_mm > 0 and v.co.z < z_bot_new + 0.6 * MM:
+                v.co.z -= (1.0 - r * r) * convex_bottom_mm * MM
+        bm.to_mesh(me); bm.free()
+
+    for p in obj.data.polygons:
+        p.use_smooth = True
+    assign(obj, mat_shell)
+
+# Phase 1 — build drafted boxes only, no bevels or fillets yet.
+top_shell = _build_drafted_box(
     "module_top_shell",
     plan_x=LB_X, plan_y=LB_Y, height=TOP_H,
     z_center=(6.5 + SEAM_Z) / 2,     # +2.25
-    top_fillet_mm=0.4,
-    bot_fillet_mm=0.0,
-    dome_mm=0.5,
-    convex_bottom_mm=0.0,
+    y_offset_mm=0,
     exempt_plus_y_from_draft=True,
 )
+assert_manifold(top_shell, "phase1:drafted_box")
 
 # Bottom shell — inset 0.4 mm per side from where top shell ends.
 # Top shell at Z=SEAM_Z has footprint 26 − 2·tan(6°)·TOP_H per axis
@@ -469,19 +517,16 @@ BOT_Y_OFFSET = (_bot_plus_y + _bot_neg_y) / 2  # +0.447
 # 3.0 mm is safe by ~0.4 mm at the diagonal.
 BOT_PLAN_CORNER = 3.0
 
-bottom_shell = _build_shell(
+bottom_shell = _build_drafted_box(
     "module_bottom_shell",
     plan_x=BOT_PLAN_X, plan_y=BOT_PLAN_Y, height=BOT_H,
     z_center=(SEAM_Z - AIR_GAP + (-6.5)) / 2,
-    top_fillet_mm=0.0,
-    bot_fillet_mm=2.0,          # was 3.5 — per user, softer fillet was
-                                # inflating the corner "sphere"
-    dome_mm=0.0,
-    convex_bottom_mm=1.0,
-    exempt_plus_y_from_draft=False,
     y_offset_mm=BOT_Y_OFFSET,
-    plan_corner_mm=BOT_PLAN_CORNER,
+    exempt_plus_y_from_draft=False,
 )
+assert_manifold(bottom_shell, "phase1:drafted_box")
+
+module = bottom_shell    # alias for downstream code that references `module`
 
 # For material subtractive operations that used to target `module`,
 # now target the bottom shell (that's where USB-C mouth and dimples
@@ -544,10 +589,10 @@ for p in module.data.polygons:
 # USB-C MOUTH
 # ────────────────────────────────────────────────────────────────────
 def cut_usbc():
-    # Cut the port into BOTH shells because the mouth (Z = -2.5,
-    # height 2.56 mm) crosses the seam gap (Z = -2.15 to -2.0).
-    # Without this the port would clip to whichever shell it's
-    # applied to. Use one cutter, boolean it against both shells.
+    """Cut USB-C mouth into both shells (mouth crosses the seam gap).
+    Both shells are still Phase-1 drafted boxes — simple geometry, no
+    bevels/fillets — so the boolean has the best chance of clean output.
+    apply_boolean() asserts manifold after each cut."""
     w, h, depth = 8.34, 2.56, 4.0
     bpy.ops.mesh.primitive_cube_add(size=1)
     cutter = bpy.context.active_object
@@ -564,12 +609,8 @@ def cut_usbc():
     cutter.location = (0, LB_Y * MM / 2, -2.5 * MM)
 
     for shell in (bottom_shell, top_shell):
-        mb = shell.modifiers.new("usbc_cut", 'BOOLEAN')
-        mb.operation = 'DIFFERENCE'
-        mb.object = cutter
-        mb.solver = 'EXACT'
-        bpy.context.view_layer.objects.active = shell
-        apply_all_mods(shell)
+        apply_boolean(shell, cutter, name="usbc_cut", solver='EXACT')
+
     bpy.data.objects.remove(cutter, do_unlink=True)
 
 cut_usbc()
@@ -578,73 +619,66 @@ cut_usbc()
 # SQUEEZE DIMPLES — extruded oval, 0.8 mm deep, crisp perimeter
 # ────────────────────────────────────────────────────────────────────
 def cut_dimple(x_sign):
-    # Build an oval curve, convert to mesh, extrude to depth 0.8 mm,
-    # small perimeter bevel for crisp edge.
-    cs = bpy.data.curves.new(f"dimple_oval_{x_sign}", type='CURVE')
-    cs.dimensions = '2D'
-    spline = cs.splines.new('BEZIER')
-    # 4-point elliptical bezier: 10 mm Y × 4 mm Z
-    hw, hh = 5.0 * MM, 2.0 * MM
-    spline.bezier_points.add(3)
-    pts = spline.bezier_points
-    # Y-axis long, Z-axis short (this face is the ±X wall so oval lies
-    # in the YZ plane). We'll build it in local coords then rotate.
-    pts[0].co = Vector((0,  hw, 0))
-    pts[1].co = Vector((0,  0,  hh))
-    pts[2].co = Vector((0, -hw, 0))
-    pts[3].co = Vector((0,  0, -hh))
-    # Handles for smooth ellipse
-    k = 0.55191502  # Bezier approx of circle
-    pts[0].handle_left  = Vector((0,  hw,  k*hh))
-    pts[0].handle_right = Vector((0,  hw, -k*hh))
-    pts[1].handle_left  = Vector((0,  k*hw, hh))
-    pts[1].handle_right = Vector((0, -k*hw, hh))
-    pts[2].handle_left  = Vector((0, -hw, -k*hh))
-    pts[2].handle_right = Vector((0, -hw,  k*hh))
-    pts[3].handle_left  = Vector((0, -k*hw, -hh))
-    pts[3].handle_right = Vector((0,  k*hw, -hh))
-    spline.use_cyclic_u = True
-
-    cs.extrude = 0.8 * MM   # extrude symmetrically in X (its normal)
-    o = bpy.data.objects.new(f"dimple_cutter_{'p' if x_sign > 0 else 'n'}", cs)
-    bpy.context.collection.objects.link(o)
-    bpy.context.view_layer.objects.active = o
-    o.select_set(True)
-    bpy.ops.object.convert(target='MESH')
-
-    # Rotate 6° about Y so the cutter's normal matches the drafted
-    # ±X wall — otherwise the recess would be angled relative to the
-    # wall and read as a hole rather than a symmetric dimple.
-    # Also position centre biased slightly INWARD so the cutter has
-    # solid overlap with the module wall (MANIFOLD requires clean
-    # penetration, thin sliver overlaps fail).
-    o.rotation_euler = (0, math.radians(-x_sign * 6.0), 0)
-    o.location = (x_sign * 11.6 * MM, 0, -3.5 * MM)
-
-    # Small perimeter bevel for crisp edge (0.2 mm)
-    mb = o.modifiers.new("crisp_edge", 'BEVEL')
-    mb.width = 0.2 * MM
-    mb.segments = 3
+    """Rounded-rectangle recess. Same construction pattern as the USB-C
+    stadium cutter (box + uniform edge bevel via ANGLE limit) so the
+    input mesh is guaranteed manifold. The v6 curve→mesh oval cutter
+    produced non-manifold input which caused the EXACT solver to leak
+    open edges on subtract; the manifold assertion caught it."""
+    # Box: X = wall-normal depth, Y = long axis (10 mm), Z = short axis (4 mm)
+    bpy.ops.mesh.primitive_cube_add(size=1)
+    o = bpy.context.active_object
+    o.name = f"dimple_cutter_{'p' if x_sign > 0 else 'n'}"
+    o.scale = (1.6 * MM, 10.0 * MM, 4.0 * MM)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    # Uniform bevel — all edges rounded to 0.5 mm. Reads as a
+    # rounded-rectangle recess after boolean (not quite an ellipse
+    # but the read is the same at concept scale).
+    mb = o.modifiers.new("round_ends", 'BEVEL')
+    mb.width = 0.5 * MM
+    mb.segments = 6
     mb.limit_method = 'ANGLE'
     mb.angle_limit = math.radians(30)
+    mb.profile = 0.5
     apply_all_mods(o)
+    assert_manifold(o, f"dimple_cutter_{'p' if x_sign > 0 else 'n'}")
 
-    # Boolean subtract — use EXACT (slower, more forgiving than
-    # MANIFOLD on drafted geometry).
-    mb = module.modifiers.new(f"dimple_{'p' if x_sign > 0 else 'n'}", 'BOOLEAN')
-    mb.operation = 'DIFFERENCE'
-    mb.object = o
-    mb.solver = 'EXACT'
-    bpy.context.view_layer.objects.active = module
-    apply_all_mods(module)
+    # Rotate 6° about Y to match drafted ±X wall normal.
+    o.rotation_euler = (0, math.radians(-x_sign * 6.0), 0)
+    # Position so the cutter's centre sits ON the wall surface,
+    # giving 0.8 mm of penetration depth (half the 1.6 mm cutter X).
+    o.location = (x_sign * 11.6 * MM, 0, -3.5 * MM)
+
+    apply_boolean(module, o, name=f"dimple_{'p' if x_sign > 0 else 'n'}", solver='EXACT')
     bpy.data.objects.remove(o, do_unlink=True)
 
 for xs in (+1, -1):
     cut_dimple(xs)
 
-# Final smooth pass
-for p in module.data.polygons:
-    p.use_smooth = True
+# ────────────────────────────────────────────────────────────────────
+# PHASE 2 — apply plan-corner bevels + top/bot perimeter fillets +
+# dome + convex bottom to both shells. Manifold-asserted after every
+# modifier apply. If any step breaks manifold, the build aborts
+# rather than silently rendering broken geometry (the v5/v6 saucer bug).
+# ────────────────────────────────────────────────────────────────────
+_apply_shell_details(
+    top_shell,
+    plan_corner_mm=4.0,
+    top_fillet_mm=0.4,       # crisp top shoulder
+    bot_fillet_mm=0.0,       # bottom edge left sharp — it's the seam step
+    dome_mm=0.5,
+    convex_bottom_mm=0.0,
+    exempt_plus_y_from_draft=True,
+)
+
+_apply_shell_details(
+    bottom_shell,
+    plan_corner_mm=BOT_PLAN_CORNER,   # 3.0 — inside top shell's drafted arc
+    top_fillet_mm=0.0,       # top edge sharp — it's the seam step
+    bot_fillet_mm=2.0,       # soft bottom
+    dome_mm=0.0,
+    convex_bottom_mm=1.0,
+    exempt_plus_y_from_draft=False,
+)
 
 # ────────────────────────────────────────────────────────────────────
 # BAND — flat ribbon exiting at SEAM_Z on both ±Y walls, symmetric,
@@ -844,6 +878,23 @@ def render(path, cam_mm, target_mm=(0,0,0), focal=85,
     bpy.ops.render.render(write_still=True)
     for L in supp:
         bpy.data.objects.remove(L, do_unlink=True)
+
+# ────────────────────────────────────────────────────────────────────
+# PRE-RENDER MESH STATS — dump the numbers for every mesh so a bad
+# build shows up in the log immediately, before we spend render time
+# on it. (Manifold has already been asserted at every boolean step
+# above; this is the belt-and-braces summary.)
+# ────────────────────────────────────────────────────────────────────
+print("\n── pre-render mesh stats ──")
+for _name in sorted(bpy.data.objects.keys()):
+    _ob = bpy.data.objects[_name]
+    if _ob.type != 'MESH' or _ob.hide_render:
+        continue
+    _s = _mesh_stats(_ob)
+    _flag = "" if (_s['non_manifold_edges'] == 0 and _s['open_edges'] == 0) else "  ← BAD"
+    print(f"  {_name:22s}  verts={_s['verts']:5d}  polys={_s['polys']:5d}  "
+          f"non_manifold_e={_s['non_manifold_edges']:4d}  open_e={_s['open_edges']:4d}{_flag}")
+print()
 
 # ────────────────────────────────────────────────────────────────────
 # FIVE RENDERS
