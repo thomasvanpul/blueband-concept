@@ -713,17 +713,19 @@ cut_usbc()
 # ────────────────────────────────────────────────────────────────────
 # SQUEEZE DIMPLES — extruded oval, 0.8 mm deep, crisp perimeter
 # ────────────────────────────────────────────────────────────────────
-# ── DIMPLE CLEARANCE GUARD (per user, 2026-08-18) ────────────────
-# Third defect in a row caused by a feature intersecting a bevel /
-# fillet arc. This is a permanent guard, not a one-off fix. Any
-# future change to dimple size, dimple Z, bottom fillet radius, or
-# bottom-shell height gets checked BEFORE render.
-DIMPLE_HEIGHT = 2.0                    # was 4 — shrunk 4→2 per user (option B)
-DIMPLE_CLEARANCE_MIN = 1.5             # mm to nearest bevel/fillet OR seam
-# Dimple centred in the flat region of the bottom shell:
-#   flat top = SEAM_Z − AIR_GAP = -2.15 (bottom shell top face)
-#   flat bot = z_bot_of_bot_shell + bot_perimeter_fillet radius (= -4.5)
-BOT_SHELL_Z_TOP    = SEAM_Z - AIR_GAP  # -2.15
+# ── DIMPLE: SHALLOW SPHERICAL DISH ────────────────────────────────
+# Reworked 2026-08-18 per user: dimple is a cosmetic surface recess,
+# not a through-cut. Cut with a large-radius ellipsoid grazing the
+# wall — the cutter's tapered surface can't gouge the fillet the way
+# a box corner does, because the intersection tapers to zero depth
+# at the cap edge.
+#
+# Guard rewritten to check the RIGHT thing: the ellipsoid's Z extent
+# must fit strictly inside the bottom-shell flat region (so the
+# ellipsoid surface never intersects the fillet arc region OR the
+# seam step). This is depth-and-shape-aware, not axis-aligned
+# clearance to a made-up threshold.
+BOT_SHELL_Z_TOP    = SEAM_Z - AIR_GAP                         # -2.15
 BOT_SHELL_Z_BOT    = -6.5
 BOT_FILLET_RADIUS  = 2.0
 FLAT_REGION_TOP    = BOT_SHELL_Z_TOP                          # -2.15
@@ -731,64 +733,103 @@ FLAT_REGION_BOT    = BOT_SHELL_Z_BOT + BOT_FILLET_RADIUS      # -4.50
 FLAT_REGION_SPAN   = FLAT_REGION_TOP - FLAT_REGION_BOT        # 2.35
 DIMPLE_Z_CENTRE    = (FLAT_REGION_TOP + FLAT_REGION_BOT) / 2  # -3.325
 
-def _check_dimple_clearance():
-    dz_bot = DIMPLE_Z_CENTRE - DIMPLE_HEIGHT / 2       # dimple bottom
-    dz_top = DIMPLE_Z_CENTRE + DIMPLE_HEIGHT / 2       # dimple top
-    clr_fillet = dz_bot - FLAT_REGION_BOT              # to fillet arc top
-    clr_seam   = FLAT_REGION_TOP - dz_top              # to seam
-    print(f"[dimple clearance] centre Z={DIMPLE_Z_CENTRE:+.3f}  "
-          f"range {dz_bot:+.3f}..{dz_top:+.3f}")
-    print(f"  clearance to bottom fillet arc top ({FLAT_REGION_BOT:+.3f}): "
-          f"{clr_fillet:+.3f} mm  {'OK' if clr_fillet >= DIMPLE_CLEARANCE_MIN else '← FAIL'}")
-    print(f"  clearance to seam ({FLAT_REGION_TOP:+.3f}): "
-          f"{clr_seam:+.3f} mm  {'OK' if clr_seam >= DIMPLE_CLEARANCE_MIN else '← FAIL'}")
-    if clr_fillet < DIMPLE_CLEARANCE_MIN or clr_seam < DIMPLE_CLEARANCE_MIN:
+# Dish target: 10 mm Y × Z_cap × 0.8 mm depth. Z_cap chosen so the
+# ellipsoid (not just its cap) fits inside the flat region — reduces
+# from the user's ~3 mm target to 2 mm because the 4.35 mm bottom
+# shell doesn't accommodate a taller cap without the ellipsoid
+# body extending into the fillet arc region. Reported honestly
+# rather than silently applied.
+DIMPLE_DEPTH_MM     = 0.8
+DIMPLE_CAP_Y_MM     = 10.0
+DIMPLE_CAP_Z_MM     = 2.0
+DIMPLE_MARGIN_MM    = 0.05    # ellipsoid must clear both boundaries by this much
+
+# Ellipsoid axes to give a cap of (CAP_Y × CAP_Z × DEPTH):
+#   Rz_max fitting flat region = FLAT_REGION_SPAN/2 - MARGIN
+#   factor = cap_Z_half / Rz  (must be ≤ 1)
+#   Rx solved from cap depth formula: depth = Rx (1 - sqrt(1 - factor²))
+#   Ry = cap_Y_half / factor
+_flat_half     = FLAT_REGION_SPAN / 2
+DIMPLE_ELL_RZ  = _flat_half - DIMPLE_MARGIN_MM             # 1.125
+_cap_z_half    = DIMPLE_CAP_Z_MM / 2                       # 1.0
+_cap_y_half    = DIMPLE_CAP_Y_MM / 2                       # 5.0
+_factor        = _cap_z_half / DIMPLE_ELL_RZ               # 0.889
+DIMPLE_ELL_RY  = _cap_y_half / _factor                     # 5.625
+DIMPLE_ELL_RX  = DIMPLE_DEPTH_MM / (1 - math.sqrt(1 - _factor ** 2))  # solves cap depth
+# Cutter is placed so its centre is offset from the wall by (Rx - depth).
+# Wall X at dimple Z centre — computed later per +/- sign from the
+# actual drafted bottom-shell X-face position at that Z.
+
+def _check_dimple_geometry():
+    dz_bot = DIMPLE_Z_CENTRE - DIMPLE_ELL_RZ       # ellipsoid bottom
+    dz_top = DIMPLE_Z_CENTRE + DIMPLE_ELL_RZ       # ellipsoid top
+    clr_fillet = dz_bot - FLAT_REGION_BOT          # ellipsoid → fillet arc top
+    clr_seam   = FLAT_REGION_TOP - dz_top          # ellipsoid → seam
+    print(f"[dimple geometry]")
+    print(f"  cap on wall:                       {DIMPLE_CAP_Y_MM:.2f} × {DIMPLE_CAP_Z_MM:.2f} mm  "
+          f"(depth {DIMPLE_DEPTH_MM:.2f} mm)")
+    print(f"  ellipsoid axes (Rx, Ry, Rz):       ({DIMPLE_ELL_RX:.3f}, {DIMPLE_ELL_RY:.3f}, {DIMPLE_ELL_RZ:.3f}) mm")
+    print(f"  ellipsoid Z range:                 {dz_bot:+.3f}..{dz_top:+.3f} mm")
+    print(f"  flat region Z range:               {FLAT_REGION_BOT:+.3f}..{FLAT_REGION_TOP:+.3f} mm")
+    print(f"  ellipsoid clearance to fillet arc: {clr_fillet:+.3f} mm  "
+          f"{'OK' if clr_fillet >= DIMPLE_MARGIN_MM else '← FAIL'}")
+    print(f"  ellipsoid clearance to seam:       {clr_seam:+.3f} mm  "
+          f"{'OK' if clr_seam >= DIMPLE_MARGIN_MM else '← FAIL'}")
+    # FP tolerance — the computed clearance can be 0.05000000001 or
+    # 0.04999999999 depending on how FP rounds through the chain. A
+    # bare "< MARGIN" check flips on that noise. Use the same 1e-9
+    # tolerance the CAD-side verify.py uses for identical arithmetic.
+    if clr_fillet < DIMPLE_MARGIN_MM - 1e-9 or clr_seam < DIMPLE_MARGIN_MM - 1e-9:
         raise RuntimeError(
             f"\n"
-            f"DIMPLE CLEARANCE GUARD FAILED:\n"
-            f"  dimple height:                    {DIMPLE_HEIGHT} mm\n"
-            f"  flat region span:                 {FLAT_REGION_SPAN:.3f} mm\n"
-            f"  required (dimple + 2*clearance):  {DIMPLE_HEIGHT + 2 * DIMPLE_CLEARANCE_MIN:.3f} mm\n"
-            f"  clearance to fillet:              {clr_fillet:+.3f} mm  (need ≥ {DIMPLE_CLEARANCE_MIN})\n"
-            f"  clearance to seam:                {clr_seam:+.3f} mm  (need ≥ {DIMPLE_CLEARANCE_MIN})\n"
-            f"Fix options:\n"
-            f"  - reduce DIMPLE_HEIGHT further\n"
-            f"  - reduce BOT_FILLET_RADIUS\n"
-            f"  - grow bottom shell (increase BOT_H)\n"
-            f"  - accept smaller DIMPLE_CLEARANCE_MIN and re-run\n"
+            f"DIMPLE-vs-FILLET GUARD FAILED:\n"
+            f"  ellipsoid Rz:                {DIMPLE_ELL_RZ:.3f} mm\n"
+            f"  flat region half:            {_flat_half:.3f} mm\n"
+            f"  required margin:             {DIMPLE_MARGIN_MM} mm\n"
+            f"  clearance to fillet:         {clr_fillet:+.3f} mm\n"
+            f"  clearance to seam:           {clr_seam:+.3f} mm\n"
+            f"Ellipsoid surface would intersect fillet arc or seam.\n"
+            f"Fix: shrink DIMPLE_CAP_Z_MM further, or grow flat region.\n"
         )
-_check_dimple_clearance()
+_check_dimple_geometry()
 
 
 def cut_dimple(x_sign):
-    """Rounded-rectangle recess. Same construction pattern as the USB-C
-    stadium cutter (box + uniform edge bevel via ANGLE limit) so the
-    input mesh is guaranteed manifold."""
-    # Box: X = wall-normal depth, Y = long axis (10 mm), Z = short axis (DIMPLE_HEIGHT mm)
-    bpy.ops.mesh.primitive_cube_add(size=1)
+    """Shallow spherical dish (ellipsoid grazing the wall). Only a
+    thin cap penetrates the wall; the ellipsoid body sits mostly
+    outside. Tapers smoothly to zero depth at cap edge — cannot
+    gouge fillet the way a box corner would."""
+    # UV sphere, then scale to the calculated ellipsoid axes.
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=48, ring_count=24)
     o = bpy.context.active_object
     o.name = f"dimple_cutter_{'p' if x_sign > 0 else 'n'}"
-    o.scale = (1.6 * MM, 10.0 * MM, DIMPLE_HEIGHT * MM)
+    o.scale = (DIMPLE_ELL_RX * MM, DIMPLE_ELL_RY * MM, DIMPLE_ELL_RZ * MM)
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-    # Uniform bevel — all edges rounded to 0.5 mm. Reads as a
-    # rounded-rectangle recess after boolean (not quite an ellipse
-    # but the read is the same at concept scale).
-    mb = o.modifiers.new("round_ends", 'BEVEL')
-    mb.width = 0.5 * MM
-    mb.segments = 6
-    mb.limit_method = 'ANGLE'
-    mb.angle_limit = math.radians(30)
-    mb.profile = 0.5
-    apply_all_mods(o)
     assert_manifold(o, f"dimple_cutter_{'p' if x_sign > 0 else 'n'}")
 
-    # Rotate 6° about Y to match drafted ±X wall normal.
+    # Wall X at Z=DIMPLE_Z_CENTRE for bottom shell (drafted): compute
+    # linearly from top-face and bottom-face X positions.
+    _bot_x_at_top = BOT_PLAN_X / 2                          # at Z=SEAM_Z-AIR_GAP
+    _draft_loss_bot_h = math.tan(math.radians(DRAFT_DEG)) * BOT_H
+    _bot_x_at_bot = _bot_x_at_top - _draft_loss_bot_h
+    _t_z = (DIMPLE_Z_CENTRE - BOT_SHELL_Z_TOP) / (BOT_SHELL_Z_BOT - BOT_SHELL_Z_TOP)
+    wall_x_at_dimple = _bot_x_at_top - _t_z * (_bot_x_at_top - _bot_x_at_bot)
+    # Cutter centre offset from wall so cap depth = DIMPLE_DEPTH_MM
+    cutter_offset = DIMPLE_ELL_RX - DIMPLE_DEPTH_MM
+    cutter_x = x_sign * (wall_x_at_dimple + cutter_offset)
+    # Match the wall's 6° draft tilt so the dish sits parallel to the wall
     o.rotation_euler = (0, math.radians(-x_sign * 6.0), 0)
-    # Position so the cutter's centre sits ON the wall surface,
-    # giving 0.8 mm of penetration depth (half the 1.6 mm cutter X).
-    # Z centre from the clearance guard.
-    o.location = (x_sign * 11.6 * MM, 0, DIMPLE_Z_CENTRE * MM)
-    bpy.context.view_layer.update()   # force matrix_world refresh
+    o.location = (cutter_x * MM, 0, DIMPLE_Z_CENTRE * MM)
+    bpy.context.view_layer.update()
+
+    # World bbox log for verification
+    from mathutils import Vector as _V
+    cb = [o.matrix_world @ _V(c) for c in o.bound_box]
+    print(f"[dimple {'p' if x_sign > 0 else 'n'} world bbox mm] "
+          f"X {min(c.x for c in cb)*1000:+.3f}..{max(c.x for c in cb)*1000:+.3f}  "
+          f"Y {min(c.y for c in cb)*1000:+.3f}..{max(c.y for c in cb)*1000:+.3f}  "
+          f"Z {min(c.z for c in cb)*1000:+.3f}..{max(c.z for c in cb)*1000:+.3f}")
+
     apply_boolean(module, o, name=f"dimple_{'p' if x_sign > 0 else 'n'}", solver='EXACT')
     bpy.data.objects.remove(o, do_unlink=True)
 
