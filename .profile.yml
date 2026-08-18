@@ -1,0 +1,6 @@
+diagram: flow
+stages:
+  - [CAD, "enclosure, Fusion 360"]
+  - [PCB, "KiCad, custom board"]
+  - [FIRMWARE, "sensor loop"]
+  - [APP, "React front end"]
