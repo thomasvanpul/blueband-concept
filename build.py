@@ -920,7 +920,10 @@ def build_band():
     cs.dimensions = '2D'
     poly = cs.splines.new('POLY')
     poly.points.add(3)
-    hw, ht = 20.0 / 2 * MM, 1.2 / 2 * MM
+    # v12 fix — thickness 1.2 → 2.0. Thin ribbon showed comb artifacts
+    # at edge-on twist sections and through the (now-hidden) exposed
+    # ends in shot 6. Slightly thicker reads as a real strap.
+    hw, ht = 20.0 / 2 * MM, 2.0 / 2 * MM
     poly.points[0].co = (-hw, -ht, 0, 1)
     poly.points[1].co = (+hw, -ht, 0, 1)
     poly.points[2].co = (+hw, +ht, 0, 1)
@@ -934,7 +937,20 @@ def build_band():
     curve.dimensions = '3D'
     curve.bevel_mode = 'OBJECT'
     curve.bevel_object = xsec_obj
+    # v12 fix — comb artifact was ribbon cross-sections stacking near
+    # edge-on. Default TANGENT twist_mode produces unpredictable roll.
+    # MINIMUM twist_mode picks the frame with smallest cumulative
+    # rotation; explicit tilt=0 on every point locks it in.
+    curve.twist_mode = 'MINIMUM'
+    # v12 correction — fill_caps back ON. Disabling them exposed the
+    # ribbon interior when the module lifts (shot 6): camera sees into
+    # the open ends and picks up the internal cross-section quads,
+    # rendering as vertical bars (the "comb" the user flagged). With
+    # caps on, ends are sealed and interior is not visible.
     curve.use_fill_caps = True
+    # Reduce curve resolution — default 12 samples per segment was
+    # producing 4 short edges + 2 tiny faces at bezier junctions.
+    curve.resolution_u = 8
     spline = curve.splines.new('BEZIER')
     spline.bezier_points.add(6)   # 7 total
 
@@ -982,14 +998,43 @@ def build_band():
                 (0, -y_ex + 6,   z_ex),
                 (0, -y_ex - 6,   z_ex))
 
+    # Explicit tilt=0 on every point to lock the ribbon roll.
+    for bp in spline.bezier_points:
+        bp.tilt = 0.0
+
     band_obj = bpy.data.objects.new("band", curve)
     bpy.context.collection.objects.link(band_obj)
     assign(band_obj, mat_fabric)
     bpy.context.view_layer.objects.active = band_obj
     band_obj.select_set(True)
     bpy.ops.object.convert(target='MESH')
+
+    # v12c fix — curve→mesh conversion leaves segment quads with
+    # DUPLICATED vertices at every seam. `use_smooth=True` then has
+    # no shared normals to blend across, so each quad shades flat
+    # and adjacent quads show as visible bars (the "comb" the user
+    # flagged in shot 6). Merge coincident verts so the ribbon
+    # becomes one continuous surface with shared normals, then
+    # smooth-shade.
+    bm = bmesh.new(); bm.from_mesh(band_obj.data)
+    verts_before = len(bm.verts)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    # Force ALL edges smooth (curve→mesh conversion can mark edges
+    # sharp at segment boundaries; the merge alone doesn't clear that).
+    for e in bm.edges:
+        e.smooth = True
+    verts_after = len(bm.verts)
+    bm.to_mesh(band_obj.data); bm.free()
+    print(f"[band merge] verts {verts_before} → {verts_after}  "
+          f"({verts_before - verts_after} duplicates merged)")
     for p in band_obj.data.polygons:
         p.use_smooth = True
+    # Subsurf level 1 — subdivides each ribbon quad, gives Cycles more
+    # geometry to interpolate normals across, kills the per-segment
+    # shading bar pattern.
+    ss = band_obj.modifiers.new("subsurf", 'SUBSURF')
+    ss.levels = 1
+    ss.render_levels = 2
     return band_obj
 
 band = build_band()
@@ -1001,19 +1046,28 @@ band = build_band()
 # it prominently with the module lifted 15 mm above.
 # ────────────────────────────────────────────────────────────────────
 def build_cradle():
-    # Rounded rectangle plate slightly larger than module base.
-    # Module base (drafted) at Z ≈ -6.5 is ~24 × 38.3 mm plan.
-    # Cradle slightly larger so a 0.5 mm lip shows around perimeter.
-    cradle_plan_x = 25.0
-    cradle_plan_y = 39.0
-    cradle_h = 4.0  # tall enough to read as a base, still not dominant
+    """Thin shallow tray. Narrower than module in plan so it hides
+    behind the module silhouette when seated. Reads as a tray, not
+    a base unit. v12 rebuild per user — v11 was 25×39×4 and too tall
+    and too wide."""
+    # Module bottom (drafted) at Z=-6.5 is ~24.0 × 38.3 mm plan.
+    # Cradle NARROWER than that: 22.5 × 36.5. Module overhangs cradle
+    # by ~0.75 mm each side in X, ~0.9 mm each side in Y — enough
+    # for the module silhouette to hide the cradle when seated.
+    CRADLE_OUTER_X = 22.5
+    CRADLE_OUTER_Y = 36.5
+    CRADLE_H       = 3.0     # total height (1.5 mm floor + 1.5 mm walls)
+    CRADLE_WALL    = 1.5
+    CRADLE_FLOOR   = 1.5
+
+    # Outer box
     bpy.ops.mesh.primitive_cube_add(size=1)
-    o = bpy.context.active_object
-    o.name = "cradle"
-    o.scale = (cradle_plan_x * MM, cradle_plan_y * MM, cradle_h * MM)
+    outer = bpy.context.active_object
+    outer.name = "cradle"
+    outer.scale = (CRADLE_OUTER_X * MM, CRADLE_OUTER_Y * MM, CRADLE_H * MM)
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-    # Round plan corners to match module bottom-shell corner (3 mm)
-    me = o.data
+    # Plan-corner bevel — vertical edges only, 2 mm (matches ~bot shell corner - some)
+    me = outer.data
     bm = bmesh.new(); bm.from_mesh(me)
     bwl = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
     for e in bm.edges:
@@ -1023,39 +1077,60 @@ def build_cradle():
         dy = abs(v0.co.y - v1.co.y)
         e[bwl] = 1.0 if (dz > dx and dz > dy) else 0.0
     bm.to_mesh(me); bm.free()
-    mb = o.modifiers.new("plan_corners", 'BEVEL')
-    mb.width = 3.0 * MM
+    mb = outer.modifiers.new("plan_corners", 'BEVEL')
+    mb.width = 2.0 * MM
     mb.segments = 10
     mb.limit_method = 'WEIGHT'
-    apply_all_mods(o)
-    # Small top edge fillet so it reads soft
-    me = o.data
+    apply_all_mods(outer)
+
+    # Cavity — subtract to hollow it into a tray with 1.5 mm walls
+    # and a 1.5 mm floor. Cavity XY = outer − 2×wall = 19.5 × 33.5.
+    # Cavity extends from Z = floor_top DOWN 1.5 mm walls upward, so
+    # cavity spans from top face (extending above to ensure through-
+    # cut) down to Z = -6.5 - 1.5 = -8.0 (floor top).
+    cavity_x = CRADLE_OUTER_X - 2 * CRADLE_WALL   # 19.5
+    cavity_y = CRADLE_OUTER_Y - 2 * CRADLE_WALL   # 33.5
+    cavity_z_top = -5.0                           # well above cradle top
+    cavity_z_bot = -6.5 - (CRADLE_H - CRADLE_FLOOR)  # -8.0
+    cavity_h_span = cavity_z_top - cavity_z_bot   # 3.0
+    bpy.ops.mesh.primitive_cube_add(size=1)
+    cav = bpy.context.active_object
+    cav.name = "cradle_cavity"
+    cav.scale = (cavity_x * MM, cavity_y * MM, cavity_h_span * MM)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    cav.location = (0, 0, ((cavity_z_top + cavity_z_bot) / 2) * MM)
+
+    # Position outer BEFORE subtracting so both are in world coords aligned
+    outer.location = (0, 0, (-6.5 - CRADLE_H / 2) * MM)   # centre Z = -8.0
+    bpy.context.view_layer.update()
+
+    apply_boolean(outer, cav, name="cradle_hollow", solver='EXACT')
+    bpy.data.objects.remove(cav, do_unlink=True)
+
+    # Small top-edge fillet on the wall rims so they read soft
+    me = outer.data
     bm = bmesh.new(); bm.from_mesh(me)
     bwl = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
-    z_top = cradle_h * MM / 2
+    z_top_local = CRADLE_H * MM / 2   # local top face
     for e in bm.edges:
         v0, v1 = e.verts
         dz = abs(v0.co.z - v1.co.z)
-        if abs(v0.co.z - z_top) < 1e-4 and abs(v1.co.z - z_top) < 1e-4 and dz < 1e-4:
+        if abs(v0.co.z - z_top_local) < 1e-4 and abs(v1.co.z - z_top_local) < 1e-4 and dz < 1e-4:
             e[bwl] = 1.0
         else:
             e[bwl] = 0.0
     bm.to_mesh(me); bm.free()
-    mb = o.modifiers.new("top_fillet", 'BEVEL')
-    mb.width = 0.6 * MM
-    mb.segments = 6
+    mb = outer.modifiers.new("rim_fillet", 'BEVEL')
+    mb.width = 0.3 * MM
+    mb.segments = 4
     mb.limit_method = 'WEIGHT'
-    apply_all_mods(o)
-    for p in o.data.polygons:
+    apply_all_mods(outer)
+
+    for p in outer.data.polygons:
         p.use_smooth = True
-    # Position: top of cradle just below module underside edges.
-    # Module bottom shell bottom at Z=-6.5 (edges). Cradle top at
-    # Z=-6.5 to touch. So centre at Z = -6.5 - 4/2 = -8.5.
-    o.location = (0, 0, -8.5 * MM)
-    # Cradle uses darker matte material so the joint line reads
     mat_cradle_dark = _pbr("Cradle_Dark",  (0.030, 0.032, 0.038), rough=0.90)
-    assign(o, mat_cradle_dark)
-    return o
+    assign(outer, mat_cradle_dark)
+    return outer
 
 cradle = build_cradle()
 
