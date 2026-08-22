@@ -193,8 +193,11 @@ def apply_boolean(target, cutter, name, solver='EXACT'):
 # ────────────────────────────────────────────────────────────────────
 LB_X, LB_Y, LB_Z = 26.0, 40.0, 13.0
 SEAM_Z = -2.0            # top of the gap between shells
-OVERHANG = 0.4           # top shell overhangs bottom by this per side
-AIR_GAP = 0.15           # vertical gap between top-shell bottom face and bottom-shell top face
+# v11 (2026-08-22, per user): widen the seam so modularity reads
+# from every angle. OVERHANG 0.4→0.8, AIR_GAP 0.15→0.4 — the seam
+# is the product signature, not a hairline.
+OVERHANG = 0.8
+AIR_GAP  = 0.4
 DRAFT_DEG = 6.0
 
 # Vertical extents
@@ -733,104 +736,150 @@ FLAT_REGION_BOT    = BOT_SHELL_Z_BOT + BOT_FILLET_RADIUS      # -4.50
 FLAT_REGION_SPAN   = FLAT_REGION_TOP - FLAT_REGION_BOT        # 2.35
 DIMPLE_Z_CENTRE    = (FLAT_REGION_TOP + FLAT_REGION_BOT) / 2  # -3.325
 
-# Dish target: 10 mm Y × Z_cap × 0.8 mm depth. Z_cap chosen so the
-# ellipsoid (not just its cap) fits inside the flat region — reduces
-# from the user's ~3 mm target to 2 mm because the 4.35 mm bottom
-# shell doesn't accommodate a taller cap without the ellipsoid
-# body extending into the fillet arc region. Reported honestly
-# rather than silently applied.
-DIMPLE_DEPTH_MM     = 0.8
-DIMPLE_CAP_Y_MM     = 10.0
-DIMPLE_CAP_Z_MM     = 2.0
-DIMPLE_MARGIN_MM    = 0.05    # ellipsoid must clear both boundaries by this much
+# v11 (2026-08-22, per user): dimple is now a TWO-STAGE cut so the
+# perimeter reads as pressable — sharp 0.3 mm step at the outer
+# rectangle, smooth ellipsoid dish inside adding depth to 0.8 mm
+# at centre. Was a single smooth ellipsoid; blended too subtly into
+# the wall.
+#
+# New flat region after AIR_GAP 0.15→0.4:
+#   FLAT_REGION_TOP    = SEAM_Z - AIR_GAP = -2.40 (was -2.15)
+#   FLAT_REGION_BOT    = -4.50 (unchanged)
+#   FLAT_REGION_SPAN   = 2.10 (was 2.35)
+# Everything downstream re-fits.
+DIMPLE_MARGIN_MM         = 0.05
 
-# Ellipsoid axes to give a cap of (CAP_Y × CAP_Z × DEPTH):
-#   Rz_max fitting flat region = FLAT_REGION_SPAN/2 - MARGIN
-#   factor = cap_Z_half / Rz  (must be ≤ 1)
-#   Rx solved from cap depth formula: depth = Rx (1 - sqrt(1 - factor²))
-#   Ry = cap_Y_half / factor
-_flat_half     = FLAT_REGION_SPAN / 2
-DIMPLE_ELL_RZ  = _flat_half - DIMPLE_MARGIN_MM             # 1.125
-_cap_z_half    = DIMPLE_CAP_Z_MM / 2                       # 1.0
-_cap_y_half    = DIMPLE_CAP_Y_MM / 2                       # 5.0
-_factor        = _cap_z_half / DIMPLE_ELL_RZ               # 0.889
-DIMPLE_ELL_RY  = _cap_y_half / _factor                     # 5.625
-DIMPLE_ELL_RX  = DIMPLE_DEPTH_MM / (1 - math.sqrt(1 - _factor ** 2))  # solves cap depth
+# STAGE 1 — outer perimeter step (stadium box, sharp edges)
+DIMPLE_PERIM_Y_MM        = 10.0    # long axis
+DIMPLE_PERIM_Z_MM        = 1.8     # short axis (fits flat span 2.1 with 0.15 margin)
+DIMPLE_PERIM_DEPTH_MM    = 0.3     # sharp step at perimeter
+
+# STAGE 2 — interior dish (ellipsoid, smooth blend inside the pocket)
+DIMPLE_DISH_Y_MM         = 8.0     # inset 1.0 mm each end from perimeter
+DIMPLE_DISH_Z_MM         = 1.4     # inset 0.2 mm each side from perimeter
+DIMPLE_DISH_DEPTH_MM     = 0.8     # TOTAL depth from wall at centre
+
+# Ellipsoid geometry for stage 2 (see v10 for derivation).
+_flat_half        = FLAT_REGION_SPAN / 2                     # 1.05
+_dish_rz_max      = _flat_half - DIMPLE_MARGIN_MM            # 1.0
+_dish_cap_z_half  = DIMPLE_DISH_Z_MM / 2                     # 0.7
+_dish_cap_y_half  = DIMPLE_DISH_Y_MM / 2                     # 4.0
+_dish_factor      = _dish_cap_z_half / _dish_rz_max          # 0.7
+DIMPLE_ELL_RZ     = _dish_rz_max
+DIMPLE_ELL_RY     = _dish_cap_y_half / _dish_factor
+DIMPLE_ELL_RX     = DIMPLE_DISH_DEPTH_MM / (1 - math.sqrt(1 - _dish_factor ** 2))
+DIMPLE_DEPTH_MM   = DIMPLE_DISH_DEPTH_MM                     # for old logs
 # Cutter is placed so its centre is offset from the wall by (Rx - depth).
 # Wall X at dimple Z centre — computed later per +/- sign from the
 # actual drafted bottom-shell X-face position at that Z.
 
 def _check_dimple_geometry():
-    dz_bot = DIMPLE_Z_CENTRE - DIMPLE_ELL_RZ       # ellipsoid bottom
-    dz_top = DIMPLE_Z_CENTRE + DIMPLE_ELL_RZ       # ellipsoid top
-    clr_fillet = dz_bot - FLAT_REGION_BOT          # ellipsoid → fillet arc top
-    clr_seam   = FLAT_REGION_TOP - dz_top          # ellipsoid → seam
+    # Check BOTH cutters (perimeter box + dish ellipsoid) Z extents
+    # against the flat region. Fails if either intersects fillet
+    # arc or seam.
+    perim_half = DIMPLE_PERIM_Z_MM / 2
+    perim_bot_z = DIMPLE_Z_CENTRE - perim_half
+    perim_top_z = DIMPLE_Z_CENTRE + perim_half
+    perim_clr_fillet = perim_bot_z - FLAT_REGION_BOT
+    perim_clr_seam   = FLAT_REGION_TOP - perim_top_z
+
+    dish_bot_z = DIMPLE_Z_CENTRE - DIMPLE_ELL_RZ
+    dish_top_z = DIMPLE_Z_CENTRE + DIMPLE_ELL_RZ
+    dish_clr_fillet = dish_bot_z - FLAT_REGION_BOT
+    dish_clr_seam   = FLAT_REGION_TOP - dish_top_z
+
     print(f"[dimple geometry]")
-    print(f"  cap on wall:                       {DIMPLE_CAP_Y_MM:.2f} × {DIMPLE_CAP_Z_MM:.2f} mm  "
-          f"(depth {DIMPLE_DEPTH_MM:.2f} mm)")
-    print(f"  ellipsoid axes (Rx, Ry, Rz):       ({DIMPLE_ELL_RX:.3f}, {DIMPLE_ELL_RY:.3f}, {DIMPLE_ELL_RZ:.3f}) mm")
-    print(f"  ellipsoid Z range:                 {dz_bot:+.3f}..{dz_top:+.3f} mm")
-    print(f"  flat region Z range:               {FLAT_REGION_BOT:+.3f}..{FLAT_REGION_TOP:+.3f} mm")
-    print(f"  ellipsoid clearance to fillet arc: {clr_fillet:+.3f} mm  "
-          f"{'OK' if clr_fillet >= DIMPLE_MARGIN_MM else '← FAIL'}")
-    print(f"  ellipsoid clearance to seam:       {clr_seam:+.3f} mm  "
-          f"{'OK' if clr_seam >= DIMPLE_MARGIN_MM else '← FAIL'}")
-    # FP tolerance — the computed clearance can be 0.05000000001 or
-    # 0.04999999999 depending on how FP rounds through the chain. A
-    # bare "< MARGIN" check flips on that noise. Use the same 1e-9
-    # tolerance the CAD-side verify.py uses for identical arithmetic.
-    if clr_fillet < DIMPLE_MARGIN_MM - 1e-9 or clr_seam < DIMPLE_MARGIN_MM - 1e-9:
-        raise RuntimeError(
-            f"\n"
-            f"DIMPLE-vs-FILLET GUARD FAILED:\n"
-            f"  ellipsoid Rz:                {DIMPLE_ELL_RZ:.3f} mm\n"
-            f"  flat region half:            {_flat_half:.3f} mm\n"
-            f"  required margin:             {DIMPLE_MARGIN_MM} mm\n"
-            f"  clearance to fillet:         {clr_fillet:+.3f} mm\n"
-            f"  clearance to seam:           {clr_seam:+.3f} mm\n"
-            f"Ellipsoid surface would intersect fillet arc or seam.\n"
-            f"Fix: shrink DIMPLE_CAP_Z_MM further, or grow flat region.\n"
-        )
+    print(f"  flat region:                       {FLAT_REGION_BOT:+.3f}..{FLAT_REGION_TOP:+.3f}  (span {FLAT_REGION_SPAN:.3f} mm)")
+    print(f"  STAGE 1 perimeter box:             "
+          f"{DIMPLE_PERIM_Y_MM:.2f} × {DIMPLE_PERIM_Z_MM:.2f} × {DIMPLE_PERIM_DEPTH_MM:.2f} mm")
+    print(f"    Z range:                         {perim_bot_z:+.3f}..{perim_top_z:+.3f}")
+    print(f"    clearance to fillet / seam:      "
+          f"{perim_clr_fillet:+.3f} / {perim_clr_seam:+.3f} mm")
+    print(f"  STAGE 2 dish ellipsoid axes:       "
+          f"({DIMPLE_ELL_RX:.3f}, {DIMPLE_ELL_RY:.3f}, {DIMPLE_ELL_RZ:.3f}) mm")
+    print(f"    cap on wall:                     "
+          f"{DIMPLE_DISH_Y_MM:.2f} × {DIMPLE_DISH_Z_MM:.2f} mm  "
+          f"(depth {DIMPLE_DISH_DEPTH_MM:.2f} mm)")
+    print(f"    Z range:                         {dish_bot_z:+.3f}..{dish_top_z:+.3f}")
+    print(f"    clearance to fillet / seam:      "
+          f"{dish_clr_fillet:+.3f} / {dish_clr_seam:+.3f} mm")
+
+    for label, clr in [
+        ("perimeter→fillet", perim_clr_fillet),
+        ("perimeter→seam",   perim_clr_seam),
+        ("dish→fillet",      dish_clr_fillet),
+        ("dish→seam",        dish_clr_seam),
+    ]:
+        if clr < DIMPLE_MARGIN_MM - 1e-9:
+            raise RuntimeError(
+                f"\n"
+                f"DIMPLE-vs-FILLET GUARD FAILED on {label}:\n"
+                f"  clearance {clr:+.3f} mm < margin {DIMPLE_MARGIN_MM}\n"
+                f"  flat region span: {FLAT_REGION_SPAN:.3f} mm\n"
+                f"Fix: shrink offending dimension or grow flat region.\n"
+            )
 _check_dimple_geometry()
 
 
 def cut_dimple(x_sign):
-    """Shallow spherical dish (ellipsoid grazing the wall). Only a
-    thin cap penetrates the wall; the ellipsoid body sits mostly
-    outside. Tapers smoothly to zero depth at cap edge — cannot
-    gouge fillet the way a box corner would."""
-    # UV sphere, then scale to the calculated ellipsoid axes.
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=48, ring_count=24)
-    o = bpy.context.active_object
-    o.name = f"dimple_cutter_{'p' if x_sign > 0 else 'n'}"
-    o.scale = (DIMPLE_ELL_RX * MM, DIMPLE_ELL_RY * MM, DIMPLE_ELL_RZ * MM)
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-    assert_manifold(o, f"dimple_cutter_{'p' if x_sign > 0 else 'n'}")
+    """Two-stage dimple: sharp perimeter step (stadium box) + smooth
+    interior dish (ellipsoid). The perimeter step is what makes the
+    dimple read as PRESSABLE at a glance — a smooth ellipsoid alone
+    blends invisibly into the wall (v10 issue)."""
 
-    # Wall X at Z=DIMPLE_Z_CENTRE for bottom shell (drafted): compute
-    # linearly from top-face and bottom-face X positions.
-    _bot_x_at_top = BOT_PLAN_X / 2                          # at Z=SEAM_Z-AIR_GAP
+    # ── Wall X at Z=DIMPLE_Z_CENTRE for bottom shell (drafted) ──
+    _bot_x_at_top = BOT_PLAN_X / 2
     _draft_loss_bot_h = math.tan(math.radians(DRAFT_DEG)) * BOT_H
     _bot_x_at_bot = _bot_x_at_top - _draft_loss_bot_h
     _t_z = (DIMPLE_Z_CENTRE - BOT_SHELL_Z_TOP) / (BOT_SHELL_Z_BOT - BOT_SHELL_Z_TOP)
     wall_x_at_dimple = _bot_x_at_top - _t_z * (_bot_x_at_top - _bot_x_at_bot)
-    # Cutter centre offset from wall so cap depth = DIMPLE_DEPTH_MM
-    cutter_offset = DIMPLE_ELL_RX - DIMPLE_DEPTH_MM
-    cutter_x = x_sign * (wall_x_at_dimple + cutter_offset)
-    # Match the wall's 6° draft tilt so the dish sits parallel to the wall
-    o.rotation_euler = (0, math.radians(-x_sign * 6.0), 0)
-    o.location = (cutter_x * MM, 0, DIMPLE_Z_CENTRE * MM)
+    tag = 'p' if x_sign > 0 else 'n'
+    tilt = math.radians(-x_sign * 6.0)
+
+    # ── STAGE 1 — perimeter box (stadium, sharp edges) ──
+    # Box: X depth 2*DIMPLE_PERIM_DEPTH_MM (poke through wall + a bit outside)
+    perim_box_x = DIMPLE_PERIM_DEPTH_MM * 2.5
+    bpy.ops.mesh.primitive_cube_add(size=1)
+    box = bpy.context.active_object
+    box.name = f"dimple_perim_{tag}"
+    box.scale = (perim_box_x * MM, DIMPLE_PERIM_Y_MM * MM, DIMPLE_PERIM_Z_MM * MM)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    # Stadium: bevel width = half of shortest lateral dim (Z = 1.8)
+    mb = box.modifiers.new("stadium", 'BEVEL')
+    mb.width = (DIMPLE_PERIM_Z_MM / 2) * MM
+    mb.segments = 8
+    mb.limit_method = 'ANGLE'
+    mb.angle_limit = math.radians(30)
+    mb.profile = 0.5
+    apply_all_mods(box)
+    assert_manifold(box, f"dimple_perim_{tag}")
+
+    # Position: cutter mostly outside wall, only 0.3 mm penetrating
+    box_offset_x = perim_box_x / 2 - DIMPLE_PERIM_DEPTH_MM
+    box.rotation_euler = (0, tilt, 0)
+    box.location = (x_sign * (wall_x_at_dimple + box_offset_x) * MM,
+                    0, DIMPLE_Z_CENTRE * MM)
     bpy.context.view_layer.update()
+    apply_boolean(module, box, name=f"dimple_perim_{tag}", solver='EXACT')
+    bpy.data.objects.remove(box, do_unlink=True)
 
-    # World bbox log for verification
-    from mathutils import Vector as _V
-    cb = [o.matrix_world @ _V(c) for c in o.bound_box]
-    print(f"[dimple {'p' if x_sign > 0 else 'n'} world bbox mm] "
-          f"X {min(c.x for c in cb)*1000:+.3f}..{max(c.x for c in cb)*1000:+.3f}  "
-          f"Y {min(c.y for c in cb)*1000:+.3f}..{max(c.y for c in cb)*1000:+.3f}  "
-          f"Z {min(c.z for c in cb)*1000:+.3f}..{max(c.z for c in cb)*1000:+.3f}")
+    # ── STAGE 2 — interior dish (ellipsoid, smooth) ──
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=48, ring_count=24)
+    o = bpy.context.active_object
+    o.name = f"dimple_dish_{tag}"
+    o.scale = (DIMPLE_ELL_RX * MM, DIMPLE_ELL_RY * MM, DIMPLE_ELL_RZ * MM)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    assert_manifold(o, f"dimple_dish_{tag}")
 
-    apply_boolean(module, o, name=f"dimple_{'p' if x_sign > 0 else 'n'}", solver='EXACT')
+    # Cutter centre offset so cap depth = DIMPLE_DISH_DEPTH_MM (0.8)
+    # from the ORIGINAL wall (not from the pocket floor). Adds smooth
+    # blended depth INSIDE the perimeter pocket.
+    dish_offset = DIMPLE_ELL_RX - DIMPLE_DISH_DEPTH_MM
+    o.rotation_euler = (0, tilt, 0)
+    o.location = (x_sign * (wall_x_at_dimple + dish_offset) * MM,
+                  0, DIMPLE_Z_CENTRE * MM)
+    bpy.context.view_layer.update()
+    apply_boolean(module, o, name=f"dimple_dish_{tag}", solver='EXACT')
     bpy.data.objects.remove(o, do_unlink=True)
 
 for xs in (+1, -1):
@@ -946,6 +995,71 @@ def build_band():
 band = build_band()
 
 # ────────────────────────────────────────────────────────────────────
+# CRADLE — thin visible lip at module base, per v11 change 3.
+# Barely visible in normal shots (shot 1 shows a horizontal joint
+# line where module meets cradle). Shots 2-5 hide it. Shot 6 shows
+# it prominently with the module lifted 15 mm above.
+# ────────────────────────────────────────────────────────────────────
+def build_cradle():
+    # Rounded rectangle plate slightly larger than module base.
+    # Module base (drafted) at Z ≈ -6.5 is ~24 × 38.3 mm plan.
+    # Cradle slightly larger so a 0.5 mm lip shows around perimeter.
+    cradle_plan_x = 25.0
+    cradle_plan_y = 39.0
+    cradle_h = 4.0  # tall enough to read as a base, still not dominant
+    bpy.ops.mesh.primitive_cube_add(size=1)
+    o = bpy.context.active_object
+    o.name = "cradle"
+    o.scale = (cradle_plan_x * MM, cradle_plan_y * MM, cradle_h * MM)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    # Round plan corners to match module bottom-shell corner (3 mm)
+    me = o.data
+    bm = bmesh.new(); bm.from_mesh(me)
+    bwl = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
+    for e in bm.edges:
+        v0, v1 = e.verts
+        dz = abs(v0.co.z - v1.co.z)
+        dx = abs(v0.co.x - v1.co.x)
+        dy = abs(v0.co.y - v1.co.y)
+        e[bwl] = 1.0 if (dz > dx and dz > dy) else 0.0
+    bm.to_mesh(me); bm.free()
+    mb = o.modifiers.new("plan_corners", 'BEVEL')
+    mb.width = 3.0 * MM
+    mb.segments = 10
+    mb.limit_method = 'WEIGHT'
+    apply_all_mods(o)
+    # Small top edge fillet so it reads soft
+    me = o.data
+    bm = bmesh.new(); bm.from_mesh(me)
+    bwl = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
+    z_top = cradle_h * MM / 2
+    for e in bm.edges:
+        v0, v1 = e.verts
+        dz = abs(v0.co.z - v1.co.z)
+        if abs(v0.co.z - z_top) < 1e-4 and abs(v1.co.z - z_top) < 1e-4 and dz < 1e-4:
+            e[bwl] = 1.0
+        else:
+            e[bwl] = 0.0
+    bm.to_mesh(me); bm.free()
+    mb = o.modifiers.new("top_fillet", 'BEVEL')
+    mb.width = 0.6 * MM
+    mb.segments = 6
+    mb.limit_method = 'WEIGHT'
+    apply_all_mods(o)
+    for p in o.data.polygons:
+        p.use_smooth = True
+    # Position: top of cradle just below module underside edges.
+    # Module bottom shell bottom at Z=-6.5 (edges). Cradle top at
+    # Z=-6.5 to touch. So centre at Z = -6.5 - 4/2 = -8.5.
+    o.location = (0, 0, -8.5 * MM)
+    # Cradle uses darker matte material so the joint line reads
+    mat_cradle_dark = _pbr("Cradle_Dark",  (0.030, 0.032, 0.038), rough=0.90)
+    assign(o, mat_cradle_dark)
+    return o
+
+cradle = build_cradle()
+
+# ────────────────────────────────────────────────────────────────────
 # INTERNAL PARTS
 # ────────────────────────────────────────────────────────────────────
 def _box(name, sx, sy, sz, loc, mat):
@@ -1016,7 +1130,8 @@ def look_at(ob, target):
     ob.rotation_euler = d.to_track_quat('-Z', 'Y').to_euler()
 
 def render(path, cam_mm, target_mm=(0,0,0), focal=85,
-           show_band=True, show_internals=False, extra_lights=None):
+           show_band=True, show_internals=False, show_cradle=False,
+           module_z_offset_mm=0.0, extra_lights=None):
     scn.camera.location = tuple(v * MM for v in cam_mm)
     scn.camera.data.lens = focal
     look_at(scn.camera, tuple(v * MM for v in target_mm))
@@ -1030,13 +1145,26 @@ def render(path, cam_mm, target_mm=(0,0,0), focal=85,
         ob.hide_set(hidden)
 
     _hide(band, not show_band)
+    _hide(cradle, not show_cradle)
     for o in (pcb, cell, usbc):
         _hide(o, not show_internals)
+
+    # Optional module lift — translate the two shells by +Z. Band and
+    # cradle stay put so the shot reads as "module lifted out". Reset
+    # after the render so subsequent shots aren't affected.
+    lifted = []
+    if abs(module_z_offset_mm) > 1e-6:
+        for shell in (top_shell, bottom_shell):
+            shell.location = (shell.location.x, shell.location.y,
+                              shell.location.z + module_z_offset_mm * MM)
+            lifted.append(shell)
+        bpy.context.view_layer.update()
 
     # Explicit whitelist — print what will render so we can audit.
     ALWAYS_RENDER = {top_shell.name, bottom_shell.name, ground.name, backwall.name}
     conditional = []
     if show_band:      conditional.append(band.name)
+    if show_cradle:    conditional.append(cradle.name)
     if show_internals: conditional += [pcb.name, cell.name, usbc.name]
 
     visible = []
@@ -1060,6 +1188,12 @@ def render(path, cam_mm, target_mm=(0,0,0), focal=85,
     bpy.ops.render.render(write_still=True)
     for L in supp:
         bpy.data.objects.remove(L, do_unlink=True)
+    # Restore lift so next shot starts clean
+    for shell in lifted:
+        shell.location = (shell.location.x, shell.location.y,
+                          shell.location.z - module_z_offset_mm * MM)
+    if lifted:
+        bpy.context.view_layer.update()
 
 # ────────────────────────────────────────────────────────────────────
 # PRE-RENDER MESH STATS — dump the numbers for every mesh so a bad
@@ -1114,7 +1248,7 @@ print()
 # 1. Three-quarter with band
 render(os.path.join(OUT, "01_three_quarter_with_band.png"),
        cam_mm=(95, -110, 75), target_mm=(0, 0, -5), focal=85,
-       show_band=True)
+       show_band=True, show_cradle=True)
 
 # 2. Module alone, three-quarter
 render(os.path.join(OUT, "02_module_alone.png"),
@@ -1147,6 +1281,14 @@ render(os.path.join(OUT, "05_minus_x_dimple.png"),
            ("dimple_key",  9, (-200, -40, 40), (math.radians(80), 0, math.radians(80)), 250),
            ("dimple_rim", 5, (-200,  60, -10), (math.radians(100), 0, math.radians(100)), 200),
        ])
+
+# 6. Module LIFTED 15 mm out of cradle, band + cradle still in place.
+# Frames the modularity story — this is the shot that says "this
+# comes apart".
+render(os.path.join(OUT, "06_module_lifted.png"),
+       cam_mm=(95, -110, 90), target_mm=(0, 0, +5), focal=85,
+       show_band=True, show_cradle=True,
+       module_z_offset_mm=15.0)
 
 # Save .blend
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(os.path.dirname(OUT), "blueband_concept.blend"))
